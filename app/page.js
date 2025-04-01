@@ -91,7 +91,7 @@ export default function Home() {
 
       {/* {!token && <div>--Login to begin--</div>} */}
       {token && (
-        <div className="text-gray-600 flex justify-center items-center gap-3 my-4 cursor-pointer">
+        <div className="text-gray-600 flex justify-center items-center gap-3 my-4">
           <button
             onClick={handleLogout}
             className="bg-red-500 text-white px-4 py-2 rounded cursor-pointer"
@@ -102,10 +102,10 @@ export default function Home() {
         </div>
       )}
       {!token && (
-        <div className="text-gray-600 flex justify-center items-center gap-3 my-4 cursor-pointer">
+        <div className="text-gray-600 flex justify-center items-center gap-3 my-4">
           <button
             onClick={handleLogin}
-            className="bg-[#FF8000] text-white px-4 py-2 rounded"
+            className="bg-[#FF8000] text-white px-4 py-2 rounded cursor-pointer"
           >
             Login
           </button>{" "}
