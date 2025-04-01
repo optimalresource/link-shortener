@@ -3,12 +3,22 @@
 import { useState, useEffect } from "react";
 import { createLink, getLinks } from "../services/linkService";
 import toast, { Toaster } from "react-hot-toast";
+import { register } from "../services/authService";
 
 export default function Home() {
   const [originalUrl, setOriginalUrl] = useState("");
   const [name, setName] = useState("");
   const [token, setToken] = useState(null);
   const [links, setLinks] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [showLogin, setShowLogin] = useState(false);
+  const [showRegister, setShowRegister] = useState(false);
+  const [form, setForm] = useState({
+    name: "",
+    email: "",
+    password: "",
+    password_confirmation: "",
+  });
 
   useEffect(() => {
     const storedToken = localStorage.getItem("hclink_token");
@@ -21,6 +31,28 @@ export default function Home() {
   useEffect(() => {
     getLinks().then((res) => setLinks(res.data));
   }, []);
+
+  const handleChange = (e) => {
+    setForm({ ...form, [e.target.name]: e.target.value });
+  };
+
+  const handleRegister = async (e) => {
+    e.preventDefault();
+
+    if (form.password !== form.password_confirmation) {
+      toast.error("Passwords do not match!");
+      return;
+    }
+
+    try {
+      const res = await register(form);
+      localStorage.setItem("token", res.data.token);
+      toast.success("Registration successful!");
+      setToken(res.data.token);
+    } catch (error) {
+      toast.error(error.response?.data?.message || "Registration failed!");
+    }
+  };
 
   const handleLogin = async () => {
     try {
@@ -70,24 +102,99 @@ export default function Home() {
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-gray-50">
-      <h1 className="text-3xl font-bold mb-4">Link Shortener</h1>
-      <form onSubmit={handleSubmit} className="flex flex-col gap-2">
-        <input
-          className="p-2 border rounded"
-          placeholder="Enter URL"
-          value={originalUrl}
-          onChange={(e) => setOriginalUrl(e.target.value)}
-        />
-        <input
-          className="p-2 border rounded"
-          placeholder="Short Name"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-        />
-        <button className="bg-gray-700 text-white px-4 py-2 rounded cursor-pointer">
-          Shorten
-        </button>
-      </form>
+      <h1 className="text-3xl font-bold mb-4">
+        {showRegister
+          ? "Shortener Sign Up"
+          : showLogin
+          ? "Shortener Login"
+          : "Link Shortener"}
+      </h1>
+
+      {!showLogin && !showRegister && (
+        <form onSubmit={handleSubmit} className="flex flex-col gap-2">
+          <input
+            className="p-2 border rounded"
+            placeholder="Enter URL"
+            value={originalUrl}
+            onChange={(e) => setOriginalUrl(e.target.value)}
+          />
+          <input
+            className="p-2 border rounded"
+            placeholder="Short Name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+          <button className="bg-[#FF8000] text-white px-4 py-2 rounded cursor-pointer">
+            Shorten
+          </button>
+        </form>
+      )}
+
+      {showLogin && (
+        <form onSubmit={handleLogin} className="flex flex-col gap-2">
+          <input
+            className="p-2 border rounded"
+            placeholder="Enter email"
+            value={originalUrl}
+            onChange={(e) => setOriginalUrl(e.target.value)}
+          />
+          <input
+            className="p-2 border rounded"
+            placeholder="Enter password"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+          <button className="bg-[#FF8000] text-white px-4 py-2 rounded cursor-pointer">
+            Login
+          </button>
+        </form>
+      )}
+
+      {showRegister && (
+        <div className="flex flex-col items-center">
+          <Toaster position="top-right" />
+          <form onSubmit={handleRegister} className="flex flex-col gap-2">
+            <input
+              type="text"
+              className="p-2 border rounded"
+              placeholder="Name"
+              name="name"
+              onChange={handleChange}
+              required
+            />
+            <input
+              type="email"
+              className="p-2 border rounded"
+              name="email"
+              placeholder="Email"
+              onChange={handleChange}
+              required
+            />
+            <input
+              type="password"
+              className="p-2 border rounded"
+              name="password"
+              placeholder="Password"
+              onChange={handleChange}
+              required
+            />
+            <input
+              type="password"
+              className="p-2 border rounded"
+              name="password_confirmation"
+              placeholder="Confirm Password"
+              onChange={handleChange}
+              required
+            />
+            <button
+              className="bg-[#FF8000] text-white px-4 py-2 rounded cursor-pointer"
+              type="submit"
+            >
+              Register
+            </button>
+          </form>
+        </div>
+      )}
 
       {/* {!token && <div>--Login to begin--</div>} */}
       {token && (
@@ -101,15 +208,31 @@ export default function Home() {
           be safe out there
         </div>
       )}
-      {!token && (
+      {!token && !showLogin ? (
         <div className="text-gray-600 flex justify-center items-center gap-3 my-4">
           <button
-            onClick={handleLogin}
-            className="bg-[#FF8000] text-white px-4 py-2 rounded cursor-pointer"
+            onClick={() => {
+              setShowLogin(true);
+              setShowRegister(false);
+            }}
+            className="bg-gray-700 text-white px-4 py-2 rounded cursor-pointer"
           >
             Login
           </button>{" "}
           <span>for a smooth ride</span>
+        </div>
+      ) : (
+        <div className="text-gray-600 flex justify-center items-center gap-3 my-4">
+          <button
+            onClick={() => {
+              setShowRegister(true);
+              setShowLogin(false);
+            }}
+            className="bg-gray-900 text-white px-4 py-2 rounded cursor-pointer"
+          >
+            Register
+          </button>{" "}
+          <span>as a newbie!</span>
         </div>
       )}
 
