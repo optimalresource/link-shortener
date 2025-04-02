@@ -7,7 +7,7 @@ import { register } from "../services/authService";
 
 export default function Home() {
   const [originalUrl, setOriginalUrl] = useState("");
-  const [name, setName] = useState("");
+  const [shortCode, setShortCode] = useState("");
   const [token, setToken] = useState(null);
   const [links, setLinks] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -19,6 +19,7 @@ export default function Home() {
     password: "",
     password_confirmation: "",
   });
+  const [suggestion, setSuggestion] = useState("");
 
   useEffect(() => {
     const storedToken = localStorage.getItem("hclink_token");
@@ -34,6 +35,23 @@ export default function Home() {
 
   const handleChange = (e) => {
     setForm({ ...form, [e.target.name]: e.target.value });
+  };
+
+  const checkName = async () => {
+    if (!shortCode) return;
+
+    try {
+      const res = await fetch(`/api/check-name/${shortCode}`);
+      if (res.status === 409) {
+        const data = await res.json();
+        setSuggestion(data.suggestion);
+        toast.error("Name already taken! Try " + data.suggestion);
+      } else {
+        setSuggestion("");
+      }
+    } catch (error) {
+      toast.error("Error checking name");
+    }
   };
 
   const handleRegister = async (e) => {
@@ -84,17 +102,17 @@ export default function Home() {
       return;
     }
 
-    if (!originalUrl || !name) {
+    if (!originalUrl || !shortCode) {
       toast.error("Please enter a name and URL!");
       return;
     }
 
     try {
-      await createLink({ original_url: originalUrl, name });
-      setLinks([...links, { original_url: originalUrl, name, clicks: 0 }]);
+      await createLink({ original_url: originalUrl, shortCode });
+      setLinks([...links, { original_url: originalUrl, shortCode, clicks: 0 }]);
       setOriginalUrl("");
       toast.success("Link shortened successfully!");
-      setName("");
+      setShortCode("");
     } catch (error) {
       toast.error("Error creating link. Try again!");
     }
@@ -118,12 +136,23 @@ export default function Home() {
             value={originalUrl}
             onChange={(e) => setOriginalUrl(e.target.value)}
           />
-          <input
-            className="p-2 border rounded"
-            placeholder="Short Name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-          />
+
+          <div className="flex items-center">
+            <input
+              className="p-2 border rounded"
+              placeholder="Optional Short Name"
+              value={name}
+              onChange={(e) => setShortCode(e.target.value)}
+            />
+            {suggestion && (
+              <button
+                onClick={() => setShortCode(suggestion)}
+                className="ml-2 text-blue-500 underline"
+              >
+                Use {suggestion}
+              </button>
+            )}
+          </div>
           <button className="bg-[#FF8000] text-white px-4 py-2 rounded cursor-pointer">
             Shorten
           </button>
@@ -141,8 +170,8 @@ export default function Home() {
           <input
             className="p-2 border rounded"
             placeholder="Enter password"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
+            value={shortCode}
+            onChange={(e) => setShortCode(e.target.value)}
           />
           <button className="bg-[#FF8000] text-white px-4 py-2 rounded cursor-pointer">
             Login
@@ -246,11 +275,11 @@ export default function Home() {
                 className="p-3 bg-white shadow rounded flex justify-between items-center"
               >
                 <a
-                  href={`http://127.0.0.1:8000/api/links/${link.name}`}
+                  href={`http://127.0.0.1:8000/api/links/${link.short_code}`}
                   target="_blank"
                   className="text-blue-600 underline"
                 >
-                  bit.link/{link.name}
+                  bit.link/{link.short_code}
                 </a>
                 <span className="text-gray-600">{link.clicks} clicks</span>
               </li>
