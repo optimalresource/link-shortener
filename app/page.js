@@ -141,7 +141,7 @@ export default function Home() {
             <input
               className="p-2 border rounded"
               placeholder="Optional Short Name"
-              value={name}
+              value={shortCode}
               onChange={(e) => setShortCode(e.target.value)}
             />
             {suggestion && (
