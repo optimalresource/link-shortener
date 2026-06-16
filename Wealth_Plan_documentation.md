@@ -291,7 +291,7 @@ A plan is modelled as a fixed monthly contribution `c` paid for `n` months, with
 
 ## 6. Wealth Plan endpoints
 
-Five **mutations** (`CreateWealthPlan`, `ActivateWealthPlan`, `TopUpWealthPlan`, `ToggleWealthPlanAutoTopUp`, `VerifyWealthPlanCharge`) and two read-only **queries** (`SimulateWealthPlan`, `GetHealthyContribution`). All require authentication and return `Result!`.
+Five **mutations** (`CreateWealthPlan`, `ActivateWealthPlan`, `TopUpWealthPlan`, `ToggleWealthPlanAutoTopUp`, `VerifyWealthPlanCharge`) and five read-only **queries** (`SimulateWealthPlan`, `GetHealthyContribution`, `PreviewWealthPlan`, `GetWealthPlanDetails`, `GetAllWealthPlans`). All require authentication and return `Result!`.
 Resolvers: [`src/api/wealth-plan.api.ts`](src/api/wealth-plan.api.ts) · Service: [`src/services/wealth-plan.service.ts`](src/services/wealth-plan.service.ts) · TypeDefs: [`src/api/typeDefs/wealth-plan.ts`](src/api/typeDefs/wealth-plan.ts).
 
 `ActivateWealthPlan`, `TopUpWealthPlan`, and `ToggleWealthPlanAutoTopUp` are guarded by the **email-verification** check (in [`src/api/index.ts`](src/api/index.ts) `EMAIL_VERIFIED_MUTATIONS`) since they can move money / set up debits. `CreateWealthPlan` and `VerifyWealthPlanCharge` are not; the two queries are pure calculations.
@@ -451,11 +451,92 @@ Returns the healthy monthly-contribution band — **15–40% of monthly income**
 }
 ```
 
-### 6.8 Still planned
+### 6.8 `PreviewWealthPlan` ✅ (Query)
+
+Rich, computed view of an **owned** plan — intended for a `PENDING_ACTIVATION` draft the user returns to (but works for any status). `data` is a JSON object. Owner-scoped (matched by `planReference` + `user`).
+
+**Input:** `planId: ID!`. **Computed:** `projectedValue = futureValue(monthlyContribution, durationMonths, r)`; `projectedInterestEarned = projectedValue − monthlyContribution·durationMonths`; `estimatedCompletionDate = (activatedAt ?? createdAt) + durationMonths`. **Conventions:** `goals` is an **array** of `{ id, title, icon, description }`; `savingMode`/`availableFundingSources` are `{ id, name }` where **`id` is the enum value `ActivateWealthPlan` accepts** (`WALLET`/`BANK_TRANSFER`/`CARD`).
+
+```jsonc
+{
+  "planId": "BW123456", "status": "PENDING_ACTIVATION", "planName": "Freedom At 45",
+  "goals": [{ "id": "FINANCIAL_FREEDOM", "title": "...", "icon": null, "description": "..." }],
+  "monthlyIncome": 3200000,
+  "savingMode": { "id": "SOLO", "name": "On My Own" },
+  "monthlyContribution": 750000, "targetAmount": 135000000,
+  "durationYears": 10.08, "durationMonths": 121,
+  "interestRate": 14.5, "interestType": "ANNUAL",
+  "projectedValue": 135480000, "projectedInterestEarned": 44730000,
+  "estimatedCompletionDate": "2036-07-01", "firstContributionAmount": 750000,
+  "availableFundingSources": [
+    { "id": "WALLET", "name": "Burse Wallet" },
+    { "id": "BANK_TRANSFER", "name": "Bank Transfer" },
+    { "id": "CARD", "name": "Debit Card" }
+  ],
+  "termsRequired": true, "activationAllowed": true, "warnings": [],
+  "giftUrl": "https://useburse.com/build-wealth/gift/<token>",
+  "createdAt": "2026-06-09T12:00:00Z"
+}
+```
+
+### 6.9 `GetWealthPlanDetails` ✅ (Query)
+
+Full details for an **ACTIVE** plan = the preview fields **plus live progress, recent activity, and action/state flags**. For a non-active plan it returns the **preview shape** (the `status` field conveys `PENDING_ACTIVATION`). Owner-scoped.
+
+**Input:** `planId: ID!`. Active responses add (on top of the preview fields):
+
+```jsonc
+{
+  "currentBalance": 560000, "totalContributed": 560000, "totalInterestEarned": 0,
+  "progress": 14.0,
+  "startDate": "2026-06-01", "endDate": "2030-11-01",
+  "nextContributionDate": "2026-07-01", "nextInterestDate": null,
+  "activatedAt": "2026-06-01T...", "lastUpdatedAt": "2026-06-09T...",
+  "fundingSource": "WALLET", "authorizationStatus": "ACTIVE",
+  "autoTopUp": true, "topUpEnabled": true, "debitDay": 1, "missedContributions": 0,
+  "recentActivity": [
+    { "date": "2026-05-25", "type": "CONTRIBUTION", "amount": 56000, "description": "Monthly contribution", "reference": "...", "balance": 560000 }
+  ],
+  "availableActions": { "canTopUp": true, "canWithdraw": false, "withdrawalWindowOpen": false, "liquidationWindowOpen": false, "canRequestLiquidation": false },
+  "currentState": { "type": "NORMAL", "message": null, "expiresAt": null },
+  "shareableLink": "https://useburse.com/build-wealth/gift/<token>"
+}
+```
+
+> `availableActions` and `currentState` are **conservative placeholders** — withdrawal/liquidation flows aren't built yet, so `canWithdraw`/`canRequestLiquidation`/window flags are `false` and state is `NORMAL`. Wire real values when those features land.
+
+### 6.10 `GetAllWealthPlans` ✅ (Query)
+
+Returns `{ summary, plans }`: a per-plan **summary list** (most recent first) plus **aggregate Build Wealth metrics** across the user's plans. One catalogue + APY fetch is shared across all plans (no N+1).
+
+```jsonc
+{
+  "summary": {
+    "totalBalance": 4820000, "totalProjectedValue": 152400000, "totalInterestEarned": 2500500,
+    "totalPlans": 5, "activePlans": 5, "maturedPlans": 0,
+    "overallAPY": 14.5, "overallProgress": 12.05, "earningsAcrossPlans": 2500500
+  },
+  "plans": [
+    {
+      "planId": "BW123456", "planName": "Ikile Master's Fees",
+      "goals": [{ "id": "CHILD_FUTURE", "title": "...", "icon": "...", "description": "..." }],
+      "currentBalance": 560000, "targetAmount": 4000000, "progress": 14.0,
+      "monthlyContribution": 56000, "nextContributionDate": "2026-07-01", "endDate": "2030-11-01",
+      "interestRate": 14.5, "durationYears": 4.4, "status": "ACTIVE",
+      "savingMode": { "id": "SOLO", "name": "On My Own" },
+      "projectedValue": 4039487, "lastActivityDate": "2026-06-01"
+    }
+  ]
+}
+```
+
+Aggregates: `totalBalance`/`totalProjectedValue`/`totalInterestEarned` are sums; `activePlans` = `ACTIVE`, `maturedPlans` = `COMPLETED`; `overallProgress = totalBalance / Σ targetAmount`; `overallAPY` = current rate; `earningsAcrossPlans` = `totalInterestEarned`.
+
+### 6.11 Still planned
 
 - **GenerateWealthSimulation** — standalone projection (daily/weekly/monthly/yearly interest), independent of any persisted plan.
 - **Gift giving/accepting** endpoints (the `giftUrl`/`giftToken` plumbing already exists on the plan).
-- **Withdrawals & penalties**, **plan listing/details**, **monthly interest compounding job**.
+- **Withdrawals & penalties** (which will populate `availableActions`/`currentState`), **monthly interest compounding job**.
 
 ---
 
@@ -520,3 +601,4 @@ Idempotency is enforced by the ledger `reference` and the `lastChargedCycle` (`Y
 | 2026-06-15 | Added wealth-plan **validation, simulation & healthy-contribution**. New reusable `wealth-plan-calculator.ts` (effective-monthly-rate annuity math; `evaluatePlan` → OK/TOO_SLOW/TOO_FAST/INVALID) and 2–20 yr + 15–40% constants. `CreateWealthPlan` now **derives & validates duration** from target + contribution (removed `durationYears` input; added `durationMonths` to the schema) and rejects unachievable pairs with guided messages. Added two authenticated queries: `SimulateWealthPlan` (duration preview / target-year adjustment → required contribution) and `GetHealthyContribution` (15–40% of income band). Added `formatNairaAbbrev` helper and a calculator jest test. |
 | 2026-06-15 | **Auto-debit activation, Direct Debit, auto top-up & gift URL.** Activation now collects exactly `monthlyContribution` (removed the `amount` input) and grants an auto-debit authorization on the chosen source. `BANK_TRANSFER` reinterpreted as **Paystack Direct Debit** for Build Wealth (initialize/charge/verify mandate; webhook captures the `authorizationCode`). Added Paystack helpers (`initializeDirectDebit`, `initializeAuthorization`, `verifyAuthorization`) and routed Build Wealth events through `WealthPlanWebhookService` (credits the plan, idempotent). New mutations `ToggleWealthPlanAutoTopUp` and `VerifyWealthPlanCharge`; `TopUpWealthPlan` keeps an arbitrary amount and supports the new sources. Added a daily **auto top-up cron** with a 3-day retry window and missed-month arrears recovery (`wealth-plan-auto-topup.ts` + pure `wealth-plan-schedule.ts`, unit-tested). Plan schema gained `giftToken`/`giftUrl` (root from new `BUILD_WEALTH_GIFT_BASE_URL` env, default `useburse.com`), funding/authorization/schedule/retry fields, and an auto-top-up scan index. |
 | 2026-06-16 | **Reliability hardening.** (1) All Build Wealth charges now send `metadata.purpose = build_wealth_*` (threaded through `chargeAuthorization`), so webhook routing is metadata-driven rather than channel-guessed. (2) Money applications are wrapped in Mongo transactions (`withTransaction`): WALLET debit + plan credit + ledger commit atomically (verified: a failed debit rolls back with zero partial writes); card/direct-debit local writes are wrapped too. (3) Added a 15-minute **reconciliation cron** (`wealth-plan-reconcile.ts`) that re-verifies outstanding `lastChargeReference`s against Paystack and applies them idempotently (using verified amount + purpose), so a lost webhook never loses a charge or causes a double-charge. Added `metadata` to `PaystackChargeAuthorizationInput`. |
+| 2026-06-16 | **Read endpoints.** Added three authenticated, owner-scoped queries so a user can fetch plans after leaving the app: `PreviewWealthPlan` (rich draft view + projections), `GetWealthPlanDetails` (active plan = preview + live progress/`recentActivity`/`availableActions`/`currentState`/`shareableLink`; non-active → preview shape), and `GetAllWealthPlans` (`{ summary, plans }` — per-plan summaries + aggregate metrics: totals, active/matured counts, overall progress/APY). `goals` returned as a `{id,title,icon,description}` **array**; `savingMode`/`availableFundingSources` as `{id,name}` with `id` = the enum value `ActivateWealthPlan` accepts. Added `WEALTH_SAVING_MODE_NAMES` + `WEALTH_FUNDING_SOURCE_OPTIONS`; reused `futureValue` for projections. Withdrawal/liquidation action flags are placeholders pending those features. |
