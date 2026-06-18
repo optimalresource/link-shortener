@@ -23,7 +23,9 @@ Module surface so far:
 | `ActivateWealthPlan` / `TopUpWealthPlan` (Card / Wallet / Bank Transfer) | ✅ Implemented |
 | Monthly interest compounding job | 🚧 Planned |
 | `GenerateWealthSimulation` (standalone projections) | 🚧 Planned |
-| Withdrawals / penalties | 🚧 Planned |
+| Withdrawal / liquidation **window state + UI copy** (read side) | ✅ Implemented (`GetWealthPlanDetails`) |
+| Withdrawal / liquidation **request / cancel / execute** (4 mutations + 7-day execution cron, PIN-guarded) | ✅ Implemented |
+| Withdrawal / liquidation **penalties** | 🚧 Planned |
 | Build Wealth interest-rate **calculation** model | 🚧 Planned (spec TBD) |
 
 ---
@@ -215,13 +217,15 @@ Schema: [`src/db/schema/wealth-plan.schema.ts`](src/db/schema/wealth-plan.schema
 | `cardId` | `ObjectId → Card \| null` | Saved card when `fundingSource = CARD`. |
 | `authorizationCode` | `String \| null` | Paystack auth code (card token or direct-debit mandate) for recurring charges. |
 | `authorizationStatus` | `WealthPlanAuthorizationStatus` | `NONE` \| `PENDING` \| `ACTIVE`. Default `NONE`. |
-| `autoTopUp` | `Boolean` | Whether scheduled auto top-up is on. Default `false` (set true at activation). |
-| `debitDay` | `Number \| null` | Day of month (1–31; 31 clamps to the month's last day) for auto top-up. |
+| `autoTopUp` | `Boolean` | Whether scheduled auto save is on. Default `false`; turned on via `ToggleWealthPlanAutoSave` (not at activation). |
+| `debitDay` | `Number \| null` | Day of month (1–31; 31 clamps to the month's last day) for auto save. Set when enabling auto save. |
 | `nextChargeDate` | `Date \| null` | Next scheduled auto-debit date. |
 | `autoTopUpRetryCount` / `autoTopUpFirstFailedAt` | `Number` / `Date \| null` | 3-day retry window bookkeeping. |
 | `missedContributions` | `Number` | Count of missed months awaiting arrears recovery. Default `0`. |
 | `lastChargedCycle` | `String \| null` | `"YYYY-MM"` of the last applied current-cycle contribution (idempotency guard). |
 | `lastChargeReference` | `String \| null` | Most recent Paystack reference initiated for the plan. |
+| `withdrawalRequest` | embedded `{ status, requestedAt, executeAt, amount, cancelledAt }` | The plan's current/most-recent **withdrawal** request. `status`: `WealthPlanRequestStatus` (`NONE` \| `IN_MOTION` \| `EXECUTED` \| `CANCELLED`, default `NONE`). `requestedAt` anchors the once-a-year lock; `executeAt` = `requestedAt` + 7 days. Drives the `withdrawal` window in §6.9. |
+| `liquidationRequest` | embedded `{ status, requestedAt, executeAt, amount, cancelledAt }` | Same shape, for **liquidation** (`amount` unused — liquidation moves the whole balance). Drives the `liquidation` window in §6.9. |
 | `createdAt` / `updatedAt` | `Date` | Timestamps. |
 
 Indexes: `{ user: 1, status: 1 }` and `{ status: 1, autoTopUp: 1, nextChargeDate: 1 }` (auto top-up scan). Repository: [`src/db/repository/wealth-plan.repository.ts`](src/db/repository/wealth-plan.repository.ts).
@@ -291,10 +295,10 @@ A plan is modelled as a fixed monthly contribution `c` paid for `n` months, with
 
 ## 6. Wealth Plan endpoints
 
-Five **mutations** (`CreateWealthPlan`, `ActivateWealthPlan`, `TopUpWealthPlan`, `ToggleWealthPlanAutoTopUp`, `VerifyWealthPlanCharge`) and five read-only **queries** (`SimulateWealthPlan`, `GetHealthyContribution`, `PreviewWealthPlan`, `GetWealthPlanDetails`, `GetAllWealthPlans`). All require authentication and return `Result!`.
+Nine **mutations** (`CreateWealthPlan`, `ActivateWealthPlan`, `TopUpWealthPlan`, `ToggleWealthPlanAutoSave`, `VerifyWealthPlanCharge`, `RequestWealthPlanWithdrawal`, `CancelWealthPlanWithdrawal`, `RequestWealthPlanLiquidation`, `CancelWealthPlanLiquidation`) and five read-only **queries** (`SimulateWealthPlan`, `GetHealthyContribution`, `PreviewWealthPlan`, `GetWealthPlanDetails`, `GetAllWealthPlans`). All require authentication and return `Result!`.
 Resolvers: [`src/api/wealth-plan.api.ts`](src/api/wealth-plan.api.ts) · Service: [`src/services/wealth-plan.service.ts`](src/services/wealth-plan.service.ts) · TypeDefs: [`src/api/typeDefs/wealth-plan.ts`](src/api/typeDefs/wealth-plan.ts).
 
-`ActivateWealthPlan`, `TopUpWealthPlan`, and `ToggleWealthPlanAutoTopUp` are guarded by the **email-verification** check (in [`src/api/index.ts`](src/api/index.ts) `EMAIL_VERIFIED_MUTATIONS`) since they can move money / set up debits. `CreateWealthPlan` and `VerifyWealthPlanCharge` are not; the two queries are pure calculations.
+`ActivateWealthPlan`, `TopUpWealthPlan`, `ToggleWealthPlanAutoSave`, `RequestWealthPlanWithdrawal`, and `RequestWealthPlanLiquidation` are guarded by the **email-verification** check (in [`src/api/index.ts`](src/api/index.ts) `EMAIL_VERIFIED_MUTATIONS`) since they can move money / set up debits; the two **request** mutations additionally validate the **transaction PIN**. `CreateWealthPlan`, `VerifyWealthPlanCharge`, and the two **cancel** mutations are not guarded (cancelling moves no money); the queries are pure reads.
 
 > **Frontend flow:** use `GetHealthyContribution` and `SimulateWealthPlan` to pre-validate while the user fills the form, then call `CreateWealthPlan`. `CreateWealthPlan` re-runs the same `evaluatePlan` check server-side, so an invalid pair is rejected even if the client skips simulation.
 
@@ -341,7 +345,7 @@ Creates a **draft** plan (`PENDING_ACTIVATION`). No money moves. **No simulation
 
 ### 6.2 `ActivateWealthPlan` ✅
 
-**Activation = pay the first contribution + grant the auto-debit authorization.** The first contribution is **always exactly `monthlyContribution`** (there is **no `amount` field** — the backend uses the plan's `monthlyContribution`). The chosen `fundingSource` becomes the recurring auto-debit source; `debitDay` sets the monthly schedule and `autoTopUp` is turned on.
+**Activation = pay the first contribution + grant the auto-debit authorization.** The first contribution is **always exactly `monthlyContribution`** (there is **no `amount` field** — the backend uses the plan's `monthlyContribution`). The chosen `fundingSource` is stored (and its card token / direct-debit mandate captured) so it can back recurring charges later. **Activation no longer collects `debitDay` and does not turn on auto save** — the recurring schedule is set separately via [`ToggleWealthPlanAutoSave`](#64-togglewealthplanautosave-) (§6.4).
 
 **Input** (`ActivateWealthPlanInput`):
 
@@ -349,8 +353,7 @@ Creates a **draft** plan (`PENDING_ACTIVATION`). No money moves. **No simulation
 {
   "planId": "BW123456",        // planReference from create
   "fundingSource": "WALLET",   // WALLET | CARD | BANK_TRANSFER (Direct Debit)
-  "cardId": "<saved-card-id>", // required only when fundingSource = CARD
-  "debitDay": 1                // 1–31 (31 = last day); day of month for auto top-up
+  "cardId": "<saved-card-id>"  // required only when fundingSource = CARD
 }
 ```
 
@@ -362,7 +365,7 @@ Creates a **draft** plan (`PENDING_ACTIVATION`). No money moves. **No simulation
 | `CARD` | Charges the saved, tokenised card now via Paystack `chargeAuthorization` (synchronous). On success → `ACTIVE`; stores `authorizationCode = card.token`, `cardId`. Non-success → error. | No |
 | `BANK_TRANSFER` | **Paystack Direct Debit.** Initializes a transaction (`channels:['bank']`, `metadata.custom_filters.recurring=true`) that both collects the first payment and creates a reusable mandate. Plan stays `PENDING_ACTIVATION`, `authorizationStatus = PENDING`. **Returns `data.paymentUrl`** — the user approves, then the **webhook** (or `VerifyWealthPlanCharge`) activates the plan and captures the mandate. | **Yes** |
 
-On `ACTIVE`, sets `activatedAt`, `nextInterestDate` (+1 month), `lastChargedCycle` (current `YYYY-MM`), `nextChargeDate` (next `debitDay`), and writes an `ACTIVATION` ledger entry. Response `data`: `{ planId, status, balance, paymentUrl, reference, message }` (`paymentUrl`/`reference` are set only for the Direct Debit flow).
+On `ACTIVE`, sets `activatedAt`, `nextInterestDate` (+1 month), `lastChargedCycle` (current `YYYY-MM`), and writes an `ACTIVATION` ledger entry. `nextChargeDate` is **not** set here (no `debitDay` yet — it is set when auto save is enabled). Response `data`: `{ planId, status, balance, paymentUrl, reference, message }` (`paymentUrl`/`reference` are set only for the Direct Debit flow).
 
 ### 6.3 `TopUpWealthPlan` ✅
 
@@ -376,14 +379,14 @@ A **discretionary extra** contribution of **any amount** (separate from the fixe
 | `CARD` | Charges the saved card now via Paystack. |
 | `BANK_TRANSFER` | Charges the stored direct-debit mandate if `authorizationStatus = ACTIVE`; otherwise initializes a one-off direct-debit transaction and **returns `data.paymentUrl`**. Async charges (`processing`) are finalized by the webhook. |
 
-### 6.4 `ToggleWealthPlanAutoTopUp` ✅
+### 6.4 `ToggleWealthPlanAutoSave` ✅
 
-Turns scheduled auto top-up on/off and lets the user switch funding source or debit day.
+Turns scheduled auto save on/off and lets the user switch funding source or debit day. (Formerly `ToggleWealthPlanAutoTopUp`.)
 
-**Input** (`ToggleWealthPlanAutoTopUpInput`): `{ planId, enabled, fundingSource?, cardId?, debitDay? }`.
+**Input** (`ToggleWealthPlanAutoSaveInput`): `{ planId, enabled, fundingSource?, cardId?, debitDay? }`.
 
 - `enabled: false` → `autoTopUp = false` (stops the cron from charging).
-- `enabled: true` → sets `autoTopUp`, `fundingSource`, `debitDay`, `nextChargeDate`. `WALLET` enables immediately; `CARD` requires a tokenised card; `BANK_TRANSFER` reuses an active mandate, otherwise **issues a Direct Debit authorization request** (`/customer/authorization/initialize`) and **returns `data.paymentUrl`** (status `PENDING` until the mandate webhook arrives).
+- `enabled: true` → sets `autoTopUp`, `fundingSource`, `debitDay`, `nextChargeDate`. When enabling, the user **chooses the funding source and the `debitDay`** (day of month, 1–31; 31 = last day) on which they want to be debited — **`debitDay` is now required** (validation error if missing). `WALLET` enables immediately; `CARD` requires a tokenised card; `BANK_TRANSFER` reuses an active mandate, otherwise **issues a Direct Debit authorization request** (`/customer/authorization/initialize`) and **returns `data.paymentUrl`** (status `PENDING` until the mandate webhook arrives).
 
 Response `data`: `{ planId, autoTopUp, paymentUrl?, reference?, message }`.
 
@@ -392,6 +395,19 @@ Response `data`: `{ planId, autoTopUp, paymentUrl?, reference?, message }`.
 Confirms a Paystack `reference` after the user returns from a payment/mandate URL. Idempotently applies the charge (activates / records the contribution) and captures any reusable card/direct-debit `authorizationCode` (so future charges are automatic). Useful as a fallback to the webhook.
 
 **Input** (`VerifyWealthPlanChargeInput`): `{ planId, reference }`. Response `data`: `{ planId, status, authorizationStatus, message }`.
+
+### 6.5a Withdrawal & liquidation requests ✅
+
+Four mutations drive the **one-per-year** withdrawal/liquidation lifecycle whose read-side state is surfaced by `GetWealthPlanDetails` (§6.9). A request doesn't move money immediately — it schedules the move for **7 days** later (`WEALTH_REQUEST_EXECUTION_DAYS`); the [execution cron](#73a-withdrawalliquidation-execution-cron) (§7.3a) settles it, and the user can cancel before then. The two **request** mutations require the **transaction PIN** (validated in the resolver, `transactionType: 'WITHDRAWAL'`) and are guarded by email verification. All four return the affected window object (`withdrawal` or `liquidation`, same shape as §6.9) in `data`, plus `planId`, `status`, and `message`.
+
+| Mutation | Input | What it does |
+| --- | --- | --- |
+| `RequestWealthPlanWithdrawal` | `{ planId, amount, transactionPin }` | Requires ACTIVE plan, **OPEN** withdrawal window, `0 < amount ≤ balance`, and no in-motion liquidation. Sets `withdrawalRequest` → `IN_MOTION` (`requestedAt`, `executeAt = +7d`, `amount`). |
+| `CancelWealthPlanWithdrawal` | `{ planId }` | Only when `IN_MOTION` (before `executeAt`). Sets `CANCELLED` + `cancelledAt`, **keeping `requestedAt`** — so the window stays `CLOSED` until the anniversary (cancelling still spends the year's allowance). |
+| `RequestWealthPlanLiquidation` | `{ planId, transactionPin }` | Requires ACTIVE plan, **OPEN** liquidation window, and no in-motion withdrawal. Sets `liquidationRequest` → `IN_MOTION`. Liquidation moves the **whole balance** (no `amount`). |
+| `CancelWealthPlanLiquidation` | `{ planId }` | Same as the withdrawal cancel, for `liquidationRequest`. |
+
+Validation failures throw `ACTION_NOT_ALLOWED` — for a non-OPEN window the thrown message is the window's own copy (e.g. "You've already used your withdrawal for this year. …"), so the client can surface it directly.
 
 ### 6.6 `SimulateWealthPlan` ✅ (Query)
 
@@ -488,6 +504,7 @@ Full details for an **ACTIVE** plan = the preview fields **plus live progress, r
 ```jsonc
 {
   "currentBalance": 560000, "totalContributed": 560000, "totalInterestEarned": 0,
+  "onTrackBalance": 3440000,   // targetAmount − currentBalance; how much is left to hit the goal (floored at 0)
   "progress": 14.0,
   "startDate": "2026-06-01", "endDate": "2030-11-01",
   "nextContributionDate": "2026-07-01", "nextInterestDate": null,
@@ -497,25 +514,63 @@ Full details for an **ACTIVE** plan = the preview fields **plus live progress, r
   "recentActivity": [
     { "date": "2026-05-25", "type": "CONTRIBUTION", "amount": 56000, "description": "Monthly contribution", "reference": "...", "balance": 560000 }
   ],
-  "availableActions": { "canTopUp": true, "canWithdraw": false, "withdrawalWindowOpen": false, "liquidationWindowOpen": false, "canRequestLiquidation": false },
-  "currentState": { "type": "NORMAL", "message": null, "expiresAt": null },
+  "withdrawal": {
+    "status": "OPEN",            // OPEN | IN_MOTION | CLOSED
+    "windowOpen": true, "inMotion": false, "canRequest": true, "canCancel": false,
+    "title": "Withdrawal window open",
+    "message": "Your withdrawal window is open from 1 January 2026 to 1 January 2027. You can withdraw from your available balance during this period.",
+    "windowStart": "1 January 2026", "windowEnd": "1 January 2027",
+    "executeAt": null, "daysLeft": null, "amount": null, "reopensAt": null
+  },
+  "liquidation": {
+    "status": "OPEN",
+    "windowOpen": true, "inMotion": false, "canRequest": true, "canCancel": false,
+    "title": "Liquidation window open",
+    "message": "Your liquidation window is open from 1 January 2026 to 1 January 2027. You can liquidate your plan and transfer your funds during this period.",
+    "windowStart": "1 January 2026", "windowEnd": "1 January 2027",
+    "executeAt": null, "daysLeft": null, "amount": null, "reopensAt": null
+  },
+  "availableActions": {
+    "canTopUp": true,
+    "canWithdraw": true, "withdrawalWindowOpen": true, "withdrawalInMotion": false, "canCancelWithdrawal": false,
+    "canRequestLiquidation": true, "liquidationWindowOpen": true, "liquidationInMotion": false, "canCancelLiquidation": false
+  },
   "shareableLink": "https://useburse.com/build-wealth/gift/<token>"
 }
 ```
 
-> `availableActions` and `currentState` are **conservative placeholders** — withdrawal/liquidation flows aren't built yet, so `canWithdraw`/`canRequestLiquidation`/window flags are `false` and state is `NORMAL`. Wire real values when those features land.
+#### Withdrawal & liquidation windows
+
+`withdrawal` and `liquidation` are the **status flags + UI copy** the screens render. Each is the same shape; the UI switches on `status`:
+
+| `status` | Meaning | Title | Message (interpolated) | Key fields |
+| --- | --- | --- | --- | --- |
+| `OPEN` | Eligible to request once this year. (Withdrawal also needs `balance > 0` for `canRequest`.) | `"Withdrawal window open"` / `"Liquidation window open"` | "Your … window is open from **windowStart** to **windowEnd**. …" | `windowStart`, `windowEnd` |
+| `IN_MOTION` | A request is pending; funds move on `executeAt` unless cancelled. | `"Withdrawal request in motion"` / `"Liquidation request in motion"` | Withdrawal: "Your request is in motion. We will move **₦amount** to your wallet on **executeAt** (**daysLeft** days left). You can cancel anytime before then." Liquidation: "Your request is in motion. **daysLeft** days left until execution. You can cancel this request anytime before then." | `executeAt`, `daysLeft`, `amount` (withdrawal), `reopensAt` |
+| `CLOSED` | The year's allowance is used (executed **or** cancelled). | `"Withdrawal window closed"` / `"Liquidation window closed"` | "You've already used your … for this year. Your … window reopens on **reopensAt**." | `reopensAt` |
+
+Convenience booleans `windowOpen` / `inMotion` mirror `status`; `canRequest` / `canCancel` are the action gates. Dates are formatted `D MMMM YYYY`; amounts as `₦1,234.00`. `availableActions` is a flat roll-up of the same flags (plus `canTopUp`).
+
+**Business rule (one request per year, per plan, per kind).** A user may make **one** withdrawal and **one** liquidation request **per year**. A request stays `IN_MOTION` for **7 days** (`WEALTH_REQUEST_EXECUTION_DAYS`) before the funds move; the user can cancel before then. **Cancelling still consumes the year's allowance** — the window stays `CLOSED` until the **anniversary of `requestedAt`** (`reopensAt`), then reopens. The annual lock is anchored to `requestedAt`, persisted on the plan's embedded `withdrawalRequest` / `liquidationRequest` (`{ status, requestedAt, executeAt, amount, cancelledAt }`).
+
+> The request / cancel / execute flows that **populate** these fields aren't built yet, so an active plan currently reports `OPEN`. The read-side state machine + copy live in the pure, unit-tested [`wealth-plan-windows.ts`](src/services/build-wealth/wealth-plan-windows.ts) (`resolveRequestWindow`) and are ready for those flows to drive.
 
 ### 6.10 `GetAllWealthPlans` ✅ (Query)
 
-Returns `{ summary, plans }`: a per-plan **summary list** (most recent first) plus **aggregate Build Wealth metrics** across the user's plans. One catalogue + APY fetch is shared across all plans (no N+1).
+Returns `{ summary, filter, plans }`: a per-plan **summary list** (most recent first) plus **aggregate Build Wealth metrics**. One catalogue + APY fetch is shared across all plans (no N+1).
+
+**Input (optional):** `status: WealthPlanStatus` — filters the returned `plans` list. **Defaults to `ACTIVE`.** Values: `ACTIVE`, `PENDING_ACTIVATION`, `COMPLETED` (matured), `CLOSED` (liquidated). The echoed `filter` field reports which status was applied.
+
+> The `plans` list is filtered, but the `summary` aggregates are **always computed across all of the user's plans regardless of status** — so `totalBalance` (and the other totals) stay stable as the user switches filters. Missing/absent values coalesce to **`0`, never `null`**.
 
 ```jsonc
 {
   "summary": {
     "totalBalance": 4820000, "totalProjectedValue": 152400000, "totalInterestEarned": 2500500,
-    "totalPlans": 5, "activePlans": 5, "maturedPlans": 0,
+    "totalPlans": 5, "activePlans": 5, "pendingPlans": 0, "maturedPlans": 0, "liquidatedPlans": 0,
     "overallAPY": 14.5, "overallProgress": 12.05, "earningsAcrossPlans": 2500500
   },
+  "filter": "ACTIVE",
   "plans": [
     {
       "planId": "BW123456", "planName": "Ikile Master's Fees",
@@ -530,13 +585,13 @@ Returns `{ summary, plans }`: a per-plan **summary list** (most recent first) pl
 }
 ```
 
-Aggregates: `totalBalance`/`totalProjectedValue`/`totalInterestEarned` are sums; `activePlans` = `ACTIVE`, `maturedPlans` = `COMPLETED`; `overallProgress = totalBalance / Σ targetAmount`; `overallAPY` = current rate; `earningsAcrossPlans` = `totalInterestEarned`.
+Aggregates (across **all** plans): `totalBalance`/`totalProjectedValue`/`totalInterestEarned` are sums (null-safe → 0); `activePlans` = `ACTIVE`, `pendingPlans` = `PENDING_ACTIVATION`, `maturedPlans` = `COMPLETED`, `liquidatedPlans` = `CLOSED`; `overallProgress = totalBalance / Σ targetAmount`; `overallAPY` = current rate; `earningsAcrossPlans` = `totalInterestEarned`.
 
 ### 6.11 Still planned
 
 - **GenerateWealthSimulation** — standalone projection (daily/weekly/monthly/yearly interest), independent of any persisted plan.
 - **Gift giving/accepting** endpoints (the `giftUrl`/`giftToken` plumbing already exists on the plan).
-- **Withdrawals & penalties** (which will populate `availableActions`/`currentState`), **monthly interest compounding job**.
+- **Early-withdrawal / liquidation penalties** — the request/cancel/execute flows now exist (§6.5a + §7.3a), but no penalty is deducted yet (the `PENALTY` ledger category is reserved for it). **Monthly interest compounding job** also pending.
 
 ---
 
@@ -554,7 +609,7 @@ Build Wealth contributions are **auto-debited** from the source the user authori
 
 Paystack helpers in [`paystack.ts`](src/services/classes/PaymentProcessors/paystack.ts):
 - `initializeDirectDebit({ email, amount, metadata })` — `channels:['bank']` + `metadata.custom_filters.recurring=true`; returns the authorization URL (collect first payment **and** create a mandate in one step). Used by activation + one-off direct-debit top-ups.
-- `initializeAuthorization({ email })` — mandate-only request (`channel:'direct_debit'`); returns a `redirectUrl`. Used by `ToggleWealthPlanAutoTopUp` when enabling Direct Debit without an existing mandate.
+- `initializeAuthorization({ email })` — mandate-only request (`channel:'direct_debit'`); returns a `redirectUrl`. Used by `ToggleWealthPlanAutoSave` when enabling Direct Debit without an existing mandate.
 - `verifyAuthorization(reference)` — confirms a mandate and returns the reusable `authorizationCode` + active flag.
 
 ### 7.2 Webhook handling
@@ -575,6 +630,15 @@ Job [`wealth-plan-auto-topup.ts`](src/jobs/wealth-plan-auto-topup.ts), scheduled
 - **Arrears recovery** — after a successful current-cycle charge, missed months are recovered **one at a time** (charge succeeds → `missedContributions--`, stop on first failure). Synchronous sources (wallet/card) loop inline; Direct Debit chains via successive webhooks. Pure scheduling/retry logic lives in [`wealth-plan-schedule.ts`](src/services/build-wealth/wealth-plan-schedule.ts) (unit-tested).
 
 Idempotency is enforced by the ledger `reference` and the `lastChargedCycle` (`YYYY-MM`) marker, so a plan is never double-charged for the same month.
+
+### 7.3a Withdrawal/liquidation execution cron
+
+Job [`wealth-plan-execute-requests.ts`](src/jobs/wealth-plan-execute-requests.ts), scheduled daily (`EVERY_DAY_AT_2AM`). It scans plans with an `IN_MOTION` `withdrawalRequest`/`liquidationRequest` whose `executeAt <= now` (backed by two scan indexes) and calls `WealthPlanService.processDueRequests`:
+
+- **Liquidation takes precedence** (it closes the plan): credit the whole balance to the wallet (`creditUsersWallet`, `savings_debit`), set `balance = 0`, `status = CLOSED`, `autoTopUp = false`, `nextChargeDate = null`, mark the request `EXECUTED`, and write a `WITHDRAWAL` ledger `DEBIT`.
+- **Withdrawal**: credit the requested amount (clamped to the live balance) to the wallet, `balance -= amount`, mark `EXECUTED`, write a `WITHDRAWAL` ledger `DEBIT`.
+
+Each settlement is wrapped in a Mongo transaction (`withTransaction`), so the wallet credit and the plan/ledger writes commit together. Flipping the request to `EXECUTED` makes the scan idempotent — a plan is settled at most once. Cancelled requests are never picked up (status ≠ `IN_MOTION`); the annual lock they leave behind is purely a read-side computation off `requestedAt` (§6.9), so no job is needed to "reopen" a window.
 
 ### 7.4 Atomicity & reconciliation (no lost writes)
 
@@ -602,3 +666,7 @@ Idempotency is enforced by the ledger `reference` and the `lastChargedCycle` (`Y
 | 2026-06-15 | **Auto-debit activation, Direct Debit, auto top-up & gift URL.** Activation now collects exactly `monthlyContribution` (removed the `amount` input) and grants an auto-debit authorization on the chosen source. `BANK_TRANSFER` reinterpreted as **Paystack Direct Debit** for Build Wealth (initialize/charge/verify mandate; webhook captures the `authorizationCode`). Added Paystack helpers (`initializeDirectDebit`, `initializeAuthorization`, `verifyAuthorization`) and routed Build Wealth events through `WealthPlanWebhookService` (credits the plan, idempotent). New mutations `ToggleWealthPlanAutoTopUp` and `VerifyWealthPlanCharge`; `TopUpWealthPlan` keeps an arbitrary amount and supports the new sources. Added a daily **auto top-up cron** with a 3-day retry window and missed-month arrears recovery (`wealth-plan-auto-topup.ts` + pure `wealth-plan-schedule.ts`, unit-tested). Plan schema gained `giftToken`/`giftUrl` (root from new `BUILD_WEALTH_GIFT_BASE_URL` env, default `useburse.com`), funding/authorization/schedule/retry fields, and an auto-top-up scan index. |
 | 2026-06-16 | **Reliability hardening.** (1) All Build Wealth charges now send `metadata.purpose = build_wealth_*` (threaded through `chargeAuthorization`), so webhook routing is metadata-driven rather than channel-guessed. (2) Money applications are wrapped in Mongo transactions (`withTransaction`): WALLET debit + plan credit + ledger commit atomically (verified: a failed debit rolls back with zero partial writes); card/direct-debit local writes are wrapped too. (3) Added a 15-minute **reconciliation cron** (`wealth-plan-reconcile.ts`) that re-verifies outstanding `lastChargeReference`s against Paystack and applies them idempotently (using verified amount + purpose), so a lost webhook never loses a charge or causes a double-charge. Added `metadata` to `PaystackChargeAuthorizationInput`. |
 | 2026-06-16 | **Read endpoints.** Added three authenticated, owner-scoped queries so a user can fetch plans after leaving the app: `PreviewWealthPlan` (rich draft view + projections), `GetWealthPlanDetails` (active plan = preview + live progress/`recentActivity`/`availableActions`/`currentState`/`shareableLink`; non-active → preview shape), and `GetAllWealthPlans` (`{ summary, plans }` — per-plan summaries + aggregate metrics: totals, active/matured counts, overall progress/APY). `goals` returned as a `{id,title,icon,description}` **array**; `savingMode`/`availableFundingSources` as `{id,name}` with `id` = the enum value `ActivateWealthPlan` accepts. Added `WEALTH_SAVING_MODE_NAMES` + `WEALTH_FUNDING_SOURCE_OPTIONS`; reused `futureValue` for projections. Withdrawal/liquidation action flags are placeholders pending those features. |
+| 2026-06-17 | **Withdrawal & liquidation request / cancel / execute.** Added the money-moving flows behind the §6.9 window state: mutations `RequestWealthPlanWithdrawal` (`{ planId, amount, transactionPin }`), `CancelWealthPlanWithdrawal`, `RequestWealthPlanLiquidation` (`{ planId, transactionPin }`), `CancelWealthPlanLiquidation` — all returning the affected window object. Requests validate the **transaction PIN** (`transactionType: 'WITHDRAWAL'`) and are email-verification guarded; they enforce the one-per-year rule via `resolveRequestWindow` (must be `OPEN`), `0 < amount ≤ balance`, and mutual exclusion (no withdrawal while a liquidation is in motion, and vice versa). A request schedules `executeAt = +7d`; the new daily **execution cron** ([`wealth-plan-execute-requests.ts`](src/jobs/wealth-plan-execute-requests.ts)) settles due `IN_MOTION` requests atomically — withdrawal credits the wallet and decrements the balance; liquidation credits the whole balance, sets `status=CLOSED`/`autoTopUp=false`, writes a `WITHDRAWAL` ledger `DEBIT`, and marks the request `EXECUTED` (idempotent). `recordLedgerEntry` now takes a `transactionType` (CREDIT default); added two execution scan indexes. |
+| 2026-06-17 | **Withdrawal & liquidation window state.** `GetWealthPlanDetails` now returns `withdrawal` and `liquidation` objects — each a `status` (`OPEN` \| `IN_MOTION` \| `CLOSED`) with mirror booleans, action gates (`canRequest`/`canCancel`), and a pre-formatted `title` + `message` (dates `D MMMM YYYY`, amounts `₦1,234.00`) matching the agreed UI copy; `availableActions` now rolls these up. Encoded the **one-request-per-year, per-kind** rule: a request is `IN_MOTION` for 7 days (`WEALTH_REQUEST_EXECUTION_DAYS`) before funds move, the user can cancel before then, and **cancelling still consumes the year's allowance** (window stays `CLOSED` until the anniversary of `requestedAt`). Added the embedded `withdrawalRequest`/`liquidationRequest` plan fields + `WealthPlanRequestStatus` enum, a `formatNaira` helper, and the pure, unit-tested `wealth-plan-windows.ts` (`resolveRequestWindow`). The request/cancel/execute flows that populate these are still pending — active plans report `OPEN` until then. |
+| 2026-06-17 | **Details + list polish.** `GetWealthPlanDetails` now returns `onTrackBalance` (= `targetAmount − currentBalance`, floored at 0 — how much is left to hit the goal). `GetAllWealthPlans` gained a `status` filter (`WealthPlanStatus` enum; **defaults to `ACTIVE`**; `COMPLETED` = matured, `CLOSED` = liquidated) that filters the `plans` list and echoes back a `filter` field; the `summary` aggregates (incl. `totalBalance`) are now computed across **all** of the user's plans regardless of filter and are **null-safe (coalesce to 0)** so `totalBalance` is never null. Added `pendingPlans`/`liquidatedPlans` counts to the summary. Added a GraphQL `WealthPlanStatus` enum. |
+| 2026-06-17 | **Activation/auto-save flow split.** `ActivateWealthPlan` no longer takes `debitDay` and no longer turns on auto save — it only collects the first contribution and captures the funding source's authorization (card token / direct-debit mandate). The recurring schedule is now set deliberately when enabling auto save. Renamed `ToggleWealthPlanAutoTopUp` → **`ToggleWealthPlanAutoSave`** (resolver, GraphQL mutation + `ToggleWealthPlanAutoSaveInput`, service `toggleAutoSave`, email-verification guard); when enabling, the user picks the funding source **and `debitDay` is now required** (validation error if missing). The persisted `autoTopUp`/`debitDay` plan fields and the cron are unchanged. |
