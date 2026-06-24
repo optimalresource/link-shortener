@@ -21,7 +21,7 @@ Module surface so far:
 | Admin-editable interest rate (default 14.5% APY) | ✅ Implemented (config + seeder) |
 | `CreateWealthPlan` (draft, validates goals) | ✅ Implemented |
 | `ActivateWealthPlan` / `TopUpWealthPlan` (Card / Wallet / Bank Transfer) | ✅ Implemented |
-| Monthly interest compounding job | 🚧 Planned |
+| Monthly interest compounding job (compounds into balance; matures plan at term) | ✅ Implemented (§5.3 / §7.3b) |
 | `GenerateWealthSimulation` (standalone projections) | 🚧 Planned |
 | Withdrawal / liquidation **window state + UI copy** (read side) | ✅ Implemented (`GetWealthPlanDetails`) |
 | Withdrawal / liquidation **request / cancel / execute** (4 mutations + 7-day execution cron, PIN-guarded) | ✅ Implemented |
@@ -31,7 +31,9 @@ Module surface so far:
 | **WHT collection & remittance** — `taxcollections` queue (Build Wealth **+ savings**) + admin list/mark-remitted endpoints | ✅ Implemented (§8) |
 | **Contribution streak + milestones** (`contributionStreak`, `wealthmilestones`, incl. anniversary job) | ✅ Implemented (§9.1) |
 | **Elite Circle** — dashboard, single member plan, cheers (+ notifications), respond, circle inbox | ✅ Implemented (§9) |
-| **Monthly interest compounding job** | 🚧 Planned (the remaining large item) |
+| **Public gift preview** (`GetWealthPlanGiftPreview`, by `giftToken`, no auth) | ✅ Implemented (§6.8a) |
+| **Gift contribution flow** (`GiftWealthPlan` payment link + `ProcessWealthPlanGift`/webhook → owner wallet → plan, public) | ✅ Implemented (§6.8b) |
+| **Exit previews by plan** (`PreviewWealthPlanWithdrawal` / `PreviewWealthPlanLiquidation`) + **interest-earned chart** (`GetWealthPlanInterestEarned`) | ✅ Implemented (§6.7b–d) |
 | Portfolio-backed **loan ("Enjoy Life")** alternative + loan-aware 30% cap | 🚧 Not in this service (dependency) |
 | Build Wealth interest-rate **calculation** model (plan-creation/simulation) | ✅ Implemented (see §5.4) |
 
@@ -215,7 +217,8 @@ Schema: [`src/db/schema/wealth-plan.schema.ts`](src/db/schema/wealth-plan.schema
 | `status` | `WealthPlanStatus` | Default `PENDING_ACTIVATION`. |
 | `balance` | `Number` | Current total balance; monthly interest **compounds** into this. Default `0`. |
 | `totalContributed` | `Number` | Lifetime contributions. Default `0`. |
-| `totalInterestEarned` | `Number` | Lifetime interest credited. Default `0`. |
+| `totalInterestEarned` | `Number` | Lifetime interest credited (**includes** the not-yet-capitalized `pendingInterest`). Default `0`. |
+| `pendingInterest` | `Number` | Interest accrued **daily** since the last monthly capitalization, **not yet compounded** into `balance`. Folded into `balance` and reset to `0` on `nextInterestDate`. See §5.3. Default `0`. |
 | `activatedAt` | `Date \| null` | Set on activation. |
 | `nextInterestDate` | `Date \| null` | Next monthly interest/maturity date once active. |
 | `giftToken` | `String` | Required, unique. Unguessable token (random 16-byte hex) identifying the plan in a shareable contribution URL. |
@@ -225,10 +228,11 @@ Schema: [`src/db/schema/wealth-plan.schema.ts`](src/db/schema/wealth-plan.schema
 | `authorizationCode` | `String \| null` | Paystack auth code (card token or direct-debit mandate) for recurring charges. |
 | `authorizationStatus` | `WealthPlanAuthorizationStatus` | `NONE` \| `PENDING` \| `ACTIVE`. Default `NONE`. |
 | `autoTopUp` | `Boolean` | Whether scheduled auto save is on. Default `false`; turned on via `ToggleWealthPlanAutoSave` (not at activation). |
-| `debitDay` | `Number \| null` | Day of month (1–31; 31 clamps to the month's last day) for auto save. Set when enabling auto save. |
+| `debitDay` | `Number \| null` | Auto-save debit day, **stored as an integer** (1, 5, 10, 15, 20, 25, or 31; 31 = last day, clamped to the month's length at charge time). The **API** takes/returns it as a `WealthDebitDay` **label** (`"1st"…"25th" \| "last"`) — `ToggleWealthPlanAutoSave` resolves the label to this integer; `GetWealthPlanDetails` maps it back. |
 | `nextChargeDate` | `Date \| null` | Next scheduled auto-debit date. |
 | `autoTopUpRetryCount` / `autoTopUpFirstFailedAt` | `Number` / `Date \| null` | 3-day retry window bookkeeping. |
 | `missedContributions` | `Number` | Count of missed months awaiting arrears recovery. Default `0`. |
+| `missedContributionDates` | `Date[]` | Scheduled dates of contributions confirmed missed, **oldest first**. A date is appended when a cycle is missed (the originally-scheduled charge date) and the **oldest** is removed as arrears recover, so its length tracks `missedContributions`. Surfaced (most recent first, formatted) by `GetWealthPlanDetails` (§6.9). Default `[]`. |
 | `contributionStreak` | `Number` | Consecutive on-time contributions up to the latest one; `+1` per current-cycle contribution (incl. activation), reset to `0` on a missed cycle. Drives the Elite Circle "streak" (§9). Default `0`. |
 | `onTimeContributions` | `Number` | Lifetime count of on-time contributions (never reset). With the elapsed schedule it yields the Elite Circle "on-time %" (§9.2). Default `0`. |
 | `lastChargedCycle` | `String \| null` | `"YYYY-MM"` of the last applied current-cycle contribution (idempotency guard). |
@@ -264,11 +268,17 @@ Indexes: `{ wealthPlan: 1, createdAt: -1 }`, `{ user: 1, createdAt: -1 }`. Repos
 
 > **Why a dedicated ledger (not `SavingsHistory`):** `SavingsHistory`'s `type` enum and `savings` ref are scoped to the legacy products (Emergency Funds / Eazilock / Target Savings), and its categories don't cover Build Wealth concepts (e.g. `PENALTY`, interest that compounds into balance rather than paying to wallet). A separate collection keeps the shared ledger clean and Build Wealth auditing self-contained.
 
-### 5.3 Interest model — how Build Wealth differs
+### 5.3 Interest model — daily accrual, monthly compounding
 
-- Once a plan is **activated**, interest accrues into the **existing interest table** ([`src/models/interest.ts`](src/models/interest.ts)), tagged with `interestType.BUILD_WEALTH`, exactly like other savings plans.
-- Interest matures **monthly**.
-- **Key difference vs Burse Vault:** Burse Vault pays the matured monthly interest **out to the user's wallet**. Build Wealth instead **adds the matured interest to the plan's `balance` so it compounds** the following month. Each maturity also writes an `INTEREST` `CREDIT` entry into `wealthplantransactions` for audit.
+Build Wealth **accrues interest daily** (so earnings grow every day, like Burse Vault) but **compounds it monthly** — the same prorate-then-mature shape as Burse Vault, except the matured interest is **capitalized into the plan** instead of paid to the wallet.
+
+- **Daily accrual.** Each night the daily-interest job (§7.3b) credits one prorated slice — `balance × r ÷ daysInCycle` (`dailyInterestAmount`, where `r` is the effective monthly rate from the current APY and `daysInCycle` is the days in the maturing cycle) — into **`pendingInterest`** and **`totalInterestEarned`**, and writes an `INTEREST` `CREDIT` entry into `wealthplantransactions`. **`balance` is not touched**, so the slice doesn't compound until month-end. Accrues on the live `balance` (so a mid-cycle contribution lifts the daily slice). **Idempotent per day** via a deterministic reference (`BW-INT-<plan>-<YYYY-MM-DD>`).
+- **Monthly compounding (capitalization).** On `nextInterestDate` (set to `activatedAt + 1 month` at activation, then advanced a month each cycle) the accrued `pendingInterest` is **folded into `balance`** (reset to 0) so it begins to compound. This is an **atomic, conditional** balance move (no new interest is recorded — it was already ledgered + counted daily), so a re-run never double-capitalizes. Because the daily slices over a cycle sum to `balance × r`, the realized monthly growth (and the projections, §5.4) stay aligned with the original monthly model.
+- **Key difference vs Burse Vault:** Burse Vault pays matured interest **out to the wallet**; Build Wealth **capitalizes it into `balance`** so it compounds.
+- **Maturity / completion:** when the advanced schedule passes the plan's term end (`activatedAt + durationMonths`), the final capitalization marks it **`COMPLETED`** (turns auto-save off, clears `nextInterestDate`/`nextChargeDate`) — "matured", no longer accruing.
+- **Relationship of the fields:** `totalInterestEarned` includes the not-yet-capitalized `pendingInterest` from the moment it accrues; `balance` lags by `pendingInterest` until month-end. On an **exit** (withdrawal/liquidation) the gross is taken from `balance` — uncapitalized `pendingInterest` isn't paid out, which is consistent with the exit rule that forfeits the **last 90 days** of interest (pending interest is always < 1 cycle old, so within that window anyway).
+
+> **Implementation note:** Build Wealth interest is computed and recorded entirely in the **dedicated `wealthplantransactions` ledger** (not the legacy `InterestModel`, which is for the other daily-accrual products). The `BUILD_WEALTH` member on the shared `interestType` enum is reserved for any future cross-product reporting but is not written by the interest job.
 
 ### 5.4 Plan math & constraints (the achievability model)
 
@@ -337,7 +347,7 @@ The early-exit/liquidation/withdrawal rules implement **`Build_Wealth_Exit_FRD_v
 - **Net to wallet** = `G − interestForfeited − serviceFee − WHT`.
 - **Stays in plan** = `B − G` (withdrawal) or `0` (liquidation).
 
-> **FRD reconciliation (decisions baked in).** The FRD's worked examples (§5.5/§5.6) and its written formulas (§7.4) disagree; the **worked examples are authoritative** here: forfeiture uses a **360-day** basis (not 365), and the **2.5% fee is on the full gross** (not on gross-minus-forfeiture). Verified against both examples: ₦500k withdrawal → ₦18,125 forfeited / ₦12,500 fee; ₦1,802,481 liquidation → ₦65,340 forfeited / ₦45,062 fee. **WHT is deducted from the wallet payout** (a product decision); the FRD example "lands in wallet" lines omit WHT, so the real net is slightly lower than those illustrations when interest has accrued. The collected WHT gets its **own ledger line** and a **`taxcollections` record** for remittance (§8). The **WHT base** (interest portion of the payout) is under-specified in the FRD — we prorate it from `I/B`; revisit once the monthly-compounding job tracks the principal/interest split per plan (until then `totalInterestEarned` is `0`, so WHT computes as `0`).
+> **FRD reconciliation (decisions baked in).** The FRD's worked examples (§5.5/§5.6) and its written formulas (§7.4) disagree; the **worked examples are authoritative** here: forfeiture uses a **360-day** basis (not 365), and the **2.5% fee is on the full gross** (not on gross-minus-forfeiture). Verified against both examples: ₦500k withdrawal → ₦18,125 forfeited / ₦12,500 fee; ₦1,802,481 liquidation → ₦65,340 forfeited / ₦45,062 fee. **WHT is deducted from the wallet payout** (a product decision); the FRD example "lands in wallet" lines omit WHT, so the real net is slightly lower than those illustrations when interest has accrued. The collected WHT gets its **own ledger line** and a **`taxcollections` record** for remittance (§8). The **WHT base** (interest portion of the payout) is under-specified in the FRD — we prorate it from `I/B` (`I = totalInterestEarned`, now fed by the monthly-compounding job, §7.3b). For a young plan with no accrued interest yet, `I = 0` so WHT is `0`.
 
 **Not in this service (dependencies).** The portfolio-backed **loan ("Enjoy Life")** alternative the FRD nudges toward — including the loan-aware variant of the 30% cap ("30% of the balance **not backing a loan**") and "liquidation blocked while loans are outstanding" — lives outside this module. The 30% cap is currently computed on the **full** balance.
 
@@ -345,7 +355,7 @@ The early-exit/liquidation/withdrawal rules implement **`Build_Wealth_Exit_FRD_v
 
 ## 6. Wealth Plan endpoints
 
-Nine **mutations** (`CreateWealthPlan`, `ActivateWealthPlan`, `TopUpWealthPlan`, `ToggleWealthPlanAutoSave`, `VerifyWealthPlanCharge`, `RequestWealthPlanWithdrawal`, `CancelWealthPlanWithdrawal`, `RequestWealthPlanLiquidation`, `CancelWealthPlanLiquidation`) and six read-only **queries** (`SimulateWealthPlan`, `GetHealthyContribution`, `GetWealthExitBreakdown`, `PreviewWealthPlan`, `GetWealthPlanDetails`, `GetAllWealthPlans`). All require authentication and return `Result!`.
+Eleven **mutations** (`CreateWealthPlan`, `ActivateWealthPlan`, `TopUpWealthPlan`, `ToggleWealthPlanAutoSave`, `VerifyWealthPlanCharge`, `RequestWealthPlanWithdrawal`, `CancelWealthPlanWithdrawal`, `RequestWealthPlanLiquidation`, `CancelWealthPlanLiquidation`, `GiftWealthPlan`, `ProcessWealthPlanGift`) and ten read-only **queries** (`SimulateWealthPlan`, `GetHealthyContribution`, `GetWealthExitBreakdown`, `PreviewWealthPlanWithdrawal`, `PreviewWealthPlanLiquidation`, `GetWealthPlanInterestEarned`, `GetWealthPlanGiftPreview`, `PreviewWealthPlan`, `GetWealthPlanDetails`, `GetAllWealthPlans`). All return `Result!`; all require authentication **except `GetWealthPlanGiftPreview`, `GiftWealthPlan`, and `ProcessWealthPlanGift`**, which are public (gift flow — a gifter may be a guest, §6.8a / §6.12).
 Resolvers: [`src/api/wealth-plan.api.ts`](src/api/wealth-plan.api.ts) · Service: [`src/services/wealth-plan.service.ts`](src/services/wealth-plan.service.ts) · TypeDefs: [`src/api/typeDefs/wealth-plan.ts`](src/api/typeDefs/wealth-plan.ts).
 
 `ActivateWealthPlan`, `TopUpWealthPlan`, `ToggleWealthPlanAutoSave`, `RequestWealthPlanWithdrawal`, and `RequestWealthPlanLiquidation` are guarded by the **email-verification** check (in [`src/api/index.ts`](src/api/index.ts) `EMAIL_VERIFIED_MUTATIONS`) since they can move money / set up debits; the two **request** mutations additionally validate the **transaction PIN**. `CreateWealthPlan`, `VerifyWealthPlanCharge`, and the two **cancel** mutations are not guarded (cancelling moves no money); the queries are pure reads.
@@ -431,20 +441,24 @@ A **discretionary extra** contribution of **any amount** (separate from the fixe
 
 ### 6.4 `ToggleWealthPlanAutoSave` ✅
 
-Turns scheduled auto save on/off and lets the user switch funding source or debit day. (Formerly `ToggleWealthPlanAutoTopUp`.)
+Turns scheduled auto save on/off, lets the user switch funding source or debit day, **and lets the user raise their monthly contribution**. (Formerly `ToggleWealthPlanAutoTopUp`.)
 
-**Input** (`ToggleWealthPlanAutoSaveInput`): `{ planId, enabled, fundingSource?, cardId?, debitDay? }`.
+**Input** (`ToggleWealthPlanAutoSaveInput`): `{ planId, enabled, fundingSource?, cardId?, debitDay?, monthlyContribution? }`.
 
 - `enabled: false` → `autoTopUp = false` (stops the cron from charging).
-- `enabled: true` → sets `autoTopUp`, `fundingSource`, `debitDay`, `nextChargeDate`. When enabling, the user **chooses the funding source and the `debitDay`** (day of month, 1–31; 31 = last day) on which they want to be debited — **`debitDay` is now required** (validation error if missing). `WALLET` enables immediately; `CARD` requires a tokenised card; `BANK_TRANSFER` reuses an active mandate, otherwise **issues a Direct Debit authorization request** (`/customer/authorization/initialize`) and **returns `data.paymentUrl`** (status `PENDING` until the mandate webhook arrives).
+- `enabled: true` → sets `autoTopUp`, `fundingSource`, `debitDay`, `nextChargeDate`. When enabling, the user **chooses the funding source and the `debitDay`** — **`debitDay` is now required** (validation error if missing). `WALLET` enables immediately; `CARD` requires a tokenised card; `BANK_TRANSFER` reuses an active mandate, otherwise **issues a Direct Debit authorization request** (`/customer/authorization/initialize`) and **returns `data.paymentUrl`** (status `PENDING` until the mandate webhook arrives).
+- **`debitDay` is a `WealthDebitDay` label, not an integer (changed):** the input takes one of **`"1st" | "5th" | "10th" | "15th" | "20th" | "25th" | "last"`** (GraphQL type `String`; `"last"` = the last day of the month). Any other value is rejected (`VALIDATION_ERROR`). The label is resolved to the stored integer day internally (`"last"` → `WEALTH_LAST_DAY_DEBIT` = 31, clamped to the month's actual last day at charge time). Previously this field was a raw `Int` (1/5/10/15/20/25/31) — not just any integer worked, hence the move to a closed enum.
+- **`monthlyContribution` (new, optional, increase-only):** raises the recurring contribution. It may **only be increased** — a value **below** the current contribution is rejected (`ACTION_NOT_ALLOWED`); equal is a no-op. Applied whether enabling or disabling. `targetAmount`/`durationMonths` are unchanged — the plan simply funds faster. (To *reduce*, there is no path: the product only allows growing the commitment.)
 
-Response `data`: `{ planId, autoTopUp, paymentUrl?, reference?, message }`.
+Response `data`: `{ planId, autoTopUp, monthlyContribution, debitDay, nextContributionDate?, paymentUrl?, reference?, message }` — the response now **echoes the updated `monthlyContribution` and `debitDay`** (the latter as a `WealthDebitDay` label) so the client can reflect the change immediately.
 
 ### 6.5 `VerifyWealthPlanCharge` ✅
 
 Confirms a Paystack `reference` after the user returns from a payment/mandate URL. Idempotently applies the charge (activates / records the contribution) and captures any reusable card/direct-debit `authorizationCode` (so future charges are automatic). Useful as a fallback to the webhook.
 
 **Input** (`VerifyWealthPlanChargeInput`): `{ planId, reference }`. Response `data`: `{ planId, status, authorizationStatus, message }`.
+
+> **Only `BANK_TRANSFER` (Direct Debit) plans hit Paystack here.** `WALLET` and `CARD` activations settle synchronously at activation time, so their `reference` is a local-only `BW-…` string that Paystack has never seen — verifying it returns `"Transaction reference not found"` (HTTP 400). The mutation now short-circuits for any non-`BANK_TRANSFER` funding source **or** an already-`ACTIVE` plan, returning the current status with `"This plan is already active; no verification needed."` instead of calling Paystack.
 
 ### 6.5a Withdrawal & liquidation requests ✅
 
@@ -458,6 +472,8 @@ Four mutations drive the **one-per-year** withdrawal/liquidation lifecycle whose
 | `CancelWealthPlanLiquidation` | `{ planId }` | Same as the withdrawal cancel, for `liquidationRequest`. A cancelled **liquidation never consumes** the window slot. |
 
 Validation failures throw `ACTION_NOT_ALLOWED` — for a non-OPEN window the thrown message is the window's own copy (e.g. "You've already used your withdrawal for this plan year. …", or the 2-year `LOCKED` copy), so the client can surface it directly. The 30%-cap rejection carries its own guided message.
+
+> **Hard 2-year gate (defense-in-depth).** Both request mutations now call an explicit `assertExitEligible(plan)` guard **before** the window check: it throws unless the plan is **activated** and `now >= activatedAt + 2 years` (FRD §3.1). This is independent of (and stricter than) the window resolver, so a withdrawal/liquidation can never execute on a plan younger than its minimum term even if the embedded request/window state is somehow inconsistent. The `GetWealthPlanDetails` windows already report `LOCKED` until that date — the exit is **not OPEN at plan creation/activation**; it only opens two years after `activatedAt`.
 
 > **The request mutations only schedule.** No charges are computed or money moved at request time — the **exit charges** (forfeited interest + 2.5% fee + 10% WHT) and the net payout are applied by the execution cron (§7.3a) using the §5.5 calc engine. The client previews the exact figures via `GetWealthExitBreakdown` (§6.7a) before the user confirms.
 
@@ -515,9 +531,12 @@ Returns the healthy monthly-contribution band — **15–40% of monthly income**
   "upperBound": 1280000,
   "status": "WITHIN",            // BELOW | WITHIN | ABOVE
   "isWithinRange": true,
+  "interestRate": 14.5,          // current Build Wealth APY (%) — shown on the form
   "message": "Based on your income, a healthy contribution is between ₦480k and ₦1.3M."
 }
 ```
+
+> `interestRate` is the current admin-editable Build Wealth APY (read via `BuildWealthSettingRepository.getInterestRate()`), so the contribution form can show the rate the user will earn without a second call.
 
 ### 6.7a `GetWealthExitBreakdown` ✅ (Query)
 
@@ -552,6 +571,148 @@ Live money breakdown for the withdrawal/liquidation amount screens (FRD §5.5/§
 ```
 
 > WHT is **deducted** from `netToWallet`. When interest has accrued, the net is a touch lower than the FRD's illustrative breakdowns (which omit WHT). See the §5.5 "FRD reconciliation" note for why these figures match the worked examples (360-day forfeiture, fee on full gross).
+
+### 6.7b `PreviewWealthPlanWithdrawal` ✅ (Query)
+
+By-`planId` preview of a **partial withdrawal** for the confirm screen — so the user sees exactly what they'll receive (and what's left) **before** they hit withdraw. Owner-scoped, **ACTIVE** plan, pure read. Runs the §5.5 calc engine and adds the **eligibility/window** so the UI knows if the action is allowed.
+
+**Input:** `PreviewWealthPlanWithdrawal(planId: ID!, amount: Float)`. When `amount` is omitted it previews the **maximum** (the 30% cap); an `amount` over the cap is clamped.
+
+**Response** (`data`) — the full §6.7a breakdown fields (`grossAmount`, `interestForfeited`, `serviceFee`, `interestPaidOut`, `wht`, `netToWallet`, `staysInPlan`, `withdrawableCap`, `clamped`) **plus**:
+
+```jsonc
+{
+  "planId": "BW123456", "kind": "WITHDRAWAL", "balance": 1802481,
+  "requestedAmount": 500000,
+  "grossAmount": 500000, "interestForfeited": 18125, "serviceFee": 12500,
+  "interestPaidOut": 0, "wht": 0, "netToWallet": 469375, "staysInPlan": 1302481,
+  "withdrawableCap": 540744.3, "clamped": false,
+  "futureCompoundingLost": 254310.55, // growth the withdrawn gross would have earned if left to compound to plan end
+  "youWillReceive": 469375,        // alias of netToWallet — what lands in the wallet
+  "remainingBalance": 1302481,     // alias of staysInPlan — what stays in the plan
+  "eligible": true,                // is a withdrawal allowed right now (window OPEN + balance)?
+  "window": { "status": "OPEN", "title": "...", "message": "...", "...": "..." },  // same shape as §6.9
+  "note": null                     // set when the amount was clamped to the cap
+}
+```
+
+**`futureCompoundingLost`** — the **opportunity cost** shown on the withdrawal screen: the future growth (interest + interest-on-interest) the withdrawn **`grossAmount`** would have earned had it stayed in the plan and compounded at the current APY until the plan's term end (`activatedAt + durationMonths`). Computed as `gross × ((1+r)^monthsRemaining − 1)` (`r` = effective monthly rate; `monthsRemaining` is fractional, floored at 0) via the pure `futureCompoundingLost` ([wealth-plan-calculator.ts](src/services/build-wealth/wealth-plan-calculator.ts)). It's **informational only** — not deducted from `netToWallet`.
+
+### 6.7c `PreviewWealthPlanLiquidation` ✅ (Query)
+
+By-`planId` preview of a **full liquidation** (closing the plan). Owner-scoped, **ACTIVE** plan, pure read. Same charge breakdown on the **whole balance**, plus eligibility/window.
+
+**Input:** `PreviewWealthPlanLiquidation(planId: ID!)`. **Response** (`data`): the §6.7a breakdown over the full balance plus `youWillReceive` (= `netToWallet`), `remainingBalance: 0`, `eligible`, and the `window` (LIQUIDATION) object (§6.9).
+
+> These two previews are deliberately separate from `GetWealthExitBreakdown` (§6.7a): they're **by-`planId`, action-specific, and carry the eligibility/window** so the frontend can wire the "Withdraw" / "Liquidate" confirm screens directly (showing penalties, fees, and the eventual balances). They **show the figures even when the window is `LOCKED`** (with `eligible: false`), so the user can preview before the 2-year date; the actual request endpoints still enforce the hard gate (§6.5a).
+
+### 6.7d `GetWealthPlanInterestEarned` ✅ (Query)
+
+The interest-earned chart for a plan. Owner-scoped, pure read. Buckets the plan's `INTEREST` ledger entries by a **primary filter** (granularity) over a **secondary filter** (date range). Since interest now accrues **daily** (§5.3), a `DAILY` series has **one point per day**; `WEEKLY`/`MONTHLY` roll those up. (A brand-new plan has an **empty `series` and `0` totals until its first nightly accrual runs** — that is expected, not a fault.)
+
+**Input** (`WealthInterestEarnedInput`):
+
+```jsonc
+{
+  "planId": "BW123456",
+  "granularity": "DAILY",   // DAILY (default) | WEEKLY | MONTHLY
+  "range": "ALL_TIME"       // ALL_TIME (default) | THIS_MONTH
+}
+```
+
+- **`granularity`** (primary) — DAILY (default), WEEKLY, or MONTHLY bucket size.
+- **`range`** (secondary) — ALL_TIME (default) or THIS_MONTH (from the start of the current month).
+
+**Response** (`data`):
+
+```jsonc
+{
+  "planId": "BW123456", "granularity": "DAILY", "range": "ALL_TIME",
+  "totalInterestEarned": 25430.55,        // sum within the selected range
+  "lifetimeInterestEarned": 25430.55,     // plan.totalInterestEarned (ignores range)
+  "series": [
+    { "period": "2026-06-19", "label": "19 Jun 2026", "amount": 12700.10 },
+    { "period": "2026-07-19", "label": "19 Jul 2026", "amount": 12730.45 }
+  ]
+}
+```
+
+> Build Wealth interest is credited **monthly** (the compounding job, §7.3b), so a DAILY/WEEKLY view simply places each monthly credit in its day/week bucket — useful once finer-grained accrual lands. `series` is oldest-first; `period` keys are `YYYY-MM-DD` (DAILY), the week-start `YYYY-MM-DD` (WEEKLY), or `YYYY-MM` (MONTHLY).
+
+### 6.8a `GetWealthPlanGiftPreview` ✅ (Query — **public, no auth**)
+
+A **guest-safe** preview for the gift-giving flow: someone following a share link may be a guest **without a Burse account** and still needs to see who/what they'd contribute toward. Keyed by the **unguessable `giftToken`** (16-byte hex) from the link — **not** the enumerable `planReference` — and returns only **non-sensitive** fields.
+
+> **Why a dedicated endpoint (not opening `GetWealthPlanDetails`).** `GetWealthPlanDetails` is owner-scoped and returns sensitive operational data (funding source, authorization status, debit day, withdrawal/liquidation windows, activity references) and is keyed by `planReference` (`BW######`, easily enumerable). Exposing it publicly would leak data and allow scraping. The gift preview instead requires the unguessable token and exposes a curated subset.
+
+**Input:** `giftToken: String!`. **Response** (`data`):
+
+```jsonc
+{
+  "planId": "BW123456", "planName": "Freedom At 45",
+  "ownerFirstName": "Ada",
+  "goals": [{ "id": "FINANCIAL_FREEDOM", "title": "...", "icon": null, "description": "..." }],
+  "targetAmount": 135000000, "currentValue": 1803051, "currentBalance": 1802481, "progress": 1.3,
+  "durationYears": 10.08, "interestRate": 14.5,
+  "status": "ACTIVE",
+  "giftUrl": "https://useburse.com/build-wealth/gift/<token>",
+  "giftStats": {
+    "giftsReceived": 12,                    // number of gifts received on this plan
+    "totalGifted": 480000,                  // total received as gifts, in Naira
+    "lastGiftDate": "2026-06-20T09:14:00.000Z" // ISO date of the most recent gift, or null
+  }
+}
+```
+
+**`giftStats`** powers the gift modal's stats card. It aggregates the plan's **gift ledger entries** — the `CONTRIBUTION` rows referenced `BW-GIFT-<paystackRef>` written by `applyGiftCharge` — so ordinary auto-debits/top-ups are excluded: `giftsReceived` = count, `totalGifted` = summed amount (Naira), `lastGiftDate` = the most recent gift's timestamp (ISO) or `null` when there are none.
+
+Excluded on purpose: `monthlyIncome`, `monthlyContribution`, funding/authorization, schedule, withdrawal/liquidation state, recent activity, and the owner's full identity (only `ownerFirstName`).
+
+### 6.8b Gift a plan — `GiftWealthPlan` / `ProcessWealthPlanGift` ✅ (Mutations — **public, no auth**)
+
+The contribution-by-guest flow behind the share link. A would-be gifter (often a guest, **no Burse account**) pays toward someone's plan; on settlement the gift is **credited to the plan owner's wallet and then moved into the plan**, leaving a full transaction trace.
+
+Both are **public** (keyed by the unguessable `giftToken`, like §6.8a — never the enumerable `planReference`).
+
+#### `GiftWealthPlan` — collect the payment
+
+Generates a Paystack payment link that accepts **any channel** (card, bank transfer, USSD, bank — the goal is just to collect the amount).
+
+**Input** (`GiftWealthPlanInput`):
+
+```jsonc
+{
+  "giftToken": "179c127c05c5fa6e969e9815ef9d756a",  // from the share link
+  "amount": 50000,
+  "gifterName": "Aunty Bisi",                         // name to show as the gifter
+  "message": "Proud of you — keep going!"             // optional note
+}
+```
+
+**Behaviour:** validates the token → plan (rejects `CLOSED`/`COMPLETED` plans), then initializes a Paystack transaction (`transaction/initialize`, **no channel restriction**) with `metadata.purpose = "build_wealth_gift"` + `planReference`, `giftToken`, `gifterName`, `giftMessage`, `userId`. **Response** (`data`):
+
+```jsonc
+{
+  "planId": "BW123456", "planName": "Freedom At 45",
+  "amount": 50000, "gifterName": "Aunty Bisi",
+  "paymentUrl": "https://checkout.paystack.com/...", "reference": "...",
+  "message": "Use the payment link to complete your gift."
+}
+```
+
+#### Settlement — webhook + `ProcessWealthPlanGift`
+
+When the payment completes, the gift is applied **once** (idempotent by the Paystack reference), via either path:
+
+- **Webhook** — `charge.success` with `metadata.purpose = build_wealth_gift` routes (through `WealthPlanWebhookService`, §7.2) to `WealthPlanService.applyGiftCharge`.
+- **`ProcessWealthPlanGift(reference)`** — a **fallback** the gifter can call after returning from the payment page. Verifies the reference with Paystack, confirms it's a `build_wealth_gift` charge, and applies it **if not already processed**. **Response** (`data`): `{ reference, planId, status, message }` where `status` ∈ `PROCESSED` | `ALREADY_PROCESSED`.
+
+**What applying a gift does (the trace).** In one Mongo transaction:
+1. **Credit the owner's wallet** with the gift amount (`creditUsersWallet`, `wallet_funded`, reference `GIFT-IN-<ref>`, narration "Build Wealth gift from <gifterName>").
+2. **Debit the wallet** by the same amount into the plan (`debitUsersWallet`, `savings_debit`, reference `BW-GIFT-<ref>`).
+3. **Credit the plan** + write a `CONTRIBUTION` ledger entry (reference `BW-GIFT-<ref>`, narration "Gift from <gifterName> — <message>").
+
+So the wallet shows the gift arriving and then moving into the plan, and the plan shows a contribution — a clear, auditable trace. The gift is applied with **top-up semantics** (`isTopUp`), so it does **not** affect the owner's own contribution **streak** / current-cycle bookkeeping. Idempotency is enforced by the `BW-GIFT-<ref>` ledger reference, so the webhook and the manual processor can both run safely.
 
 ### 6.8 `PreviewWealthPlan` ✅ (Query)
 
@@ -589,15 +750,21 @@ Full details for an **ACTIVE** plan = the preview fields **plus live progress, r
 
 ```jsonc
 {
-  "currentBalance": 560000, "totalContributed": 560000, "totalInterestEarned": 0,
+  "currentValue": 560312.45,   // headline: balance + accrued interest — grows daily (= totalContributed + totalInterestEarned)
+  "currentBalance": 560000,    // compounding / withdrawable base (capitalizes monthly)
+  "totalContributed": 560000, "totalInterestEarned": 312.45,
+  "pendingInterest": 312.45,   // accrued daily this cycle, not yet compounded into balance (§5.3)
   "withdrawableAmount": 168000, // 30% of currentBalance — most a single withdrawal can take now
   "onTrackBalance": 3440000,   // targetAmount − currentBalance; how much is left to hit the goal (floored at 0)
   "progress": 14.0,
   "startDate": "2026-06-01", "endDate": "2030-11-01",
   "nextContributionDate": "2026-07-01", "nextInterestDate": null,
+  "pendingContribution": { "amount": 56000, "date": "2026-07-01", "status": "SCHEDULED" },
   "activatedAt": "2026-06-01T...", "lastUpdatedAt": "2026-06-09T...",
   "fundingSource": "WALLET", "authorizationStatus": "ACTIVE",
-  "autoTopUp": true, "topUpEnabled": true, "debitDay": 1, "missedContributions": 0,
+  "autoTopUp": true, "topUpEnabled": true, "debitDay": "1st", // WealthDebitDay label ("1st"…"25th" | "last")
+  "missedContributions": ["20th of June 2026", "20th of May 2026"], // display dates, most recent first
+  "missedContributionsCount": 2,                                     // raw tally (badges / legacy plans)
   "recentActivity": [
     { "date": "2026-05-25", "type": "CONTRIBUTION", "amount": 56000, "description": "Monthly contribution", "reference": "...", "balance": 560000 }
   ],
@@ -639,6 +806,20 @@ Full details for an **ACTIVE** plan = the preview fields **plus live progress, r
 
 Convenience booleans `windowOpen` / `inMotion` mirror `status`; `canRequest` / `canCancel` are the action gates. Dates are formatted `D MMMM YYYY`; amounts as `₦1,234.00`. `availableActions` is a flat roll-up of the same flags (plus `canTopUp`).
 
+#### Value vs balance (live value)
+
+- **`currentValue`** — the **headline** "what my plan is worth" figure: `currentBalance + pendingInterest` (= `totalContributed + totalInterestEarned`). It **grows every day** as interest accrues, so the displayed `progress` and `onTrackBalance` are computed from it. Use this as the balance shown to the user.
+- **`currentBalance`** — the **compounding / withdrawable base** (`balance`): contributions + interest already **capitalized** in past months. It steps up monthly at capitalization (§5.3) and is what the **withdrawal cap / exit math** run on (`withdrawableAmount` = 30% of it). Mid-cycle it sits below `currentValue` by `pendingInterest`.
+
+> Same split is applied across the other wealth responses (`GetAllWealthPlans` per-plan + its `summary.totalBalance`, the gift preview, and the Elite Circle views): `currentValue` is the live, daily-growing figure; `currentBalance` is the compounding base. The cross-product `GetSavingsPortfolioAllocation` (§6.12) also counts Build Wealth at its live value.
+
+#### Contribution schedule fields (fixed)
+
+- **`nextContributionDate`** — the next scheduled auto-debit date. It now **falls back to deriving from `debitDay`** when `nextChargeDate` isn't persisted yet, so it is **no longer `null`** once the user has chosen a debit day (previously it returned `null` until the first cron run set `nextChargeDate`). These fields (`debitDay`, `autoTopUp`, `nextContributionDate`, `pendingContribution`) are also surfaced on the **base/preview** shape, so a freshly-toggled `debitDay` is reflected immediately by `GetWealthPlanDetails` even before the plan is active.
+- **`debitDay`** — returned as a **`WealthDebitDay` label** (`"1st" | "5th" | "10th" | "15th" | "20th" | "25th" | "last"`), `null` when no debit day is set — **not** the raw integer. This is the same label `ToggleWealthPlanAutoSave` accepts, so the value round-trips. (`"last"` is stored internally as 31 and clamped to the month's actual last day at charge time.)
+- **`pendingContribution`** — `{ amount, date, status }` for the next scheduled contribution. `status`: `SCHEDULED` (auto-save on, on track), `RETRYING` (a charge is in its 3-day retry window), `ARREARS` (missed months awaiting recovery), or `NOT_SCHEDULED` (auto-save off). `amount` = `monthlyContribution`; `date` = `nextContributionDate`.
+- **`missedContributions`** — an **array of display dates** (`"20th of June 2026"`), **most recent first**, one per contribution confirmed missed (after the 3-day retry window). Each missed cycle's originally-scheduled date is recorded on the plan (`missedContributionDates`) when the miss is registered and the **oldest** is removed as arrears are recovered, so the list mirrors the outstanding misses. `missedContributionsCount` carries the raw integer tally (for a count badge, and for **legacy plans** created before this field — their array is empty until a new miss is recorded). Previously this field was the integer count itself.
+
 **Business rules (Build Wealth Exit FRD, see §5.5).**
 
 - **2-year minimum term:** before `activatedAt + 2 years`, both windows are `LOCKED`.
@@ -669,7 +850,7 @@ Returns `{ summary, filter, plans }`: a per-plan **summary list** (most recent f
     {
       "planId": "BW123456", "planName": "Ikile Master's Fees",
       "goals": [{ "id": "CHILD_FUTURE", "title": "...", "icon": "...", "description": "..." }],
-      "currentBalance": 560000, "targetAmount": 4000000, "progress": 14.0,
+      "currentValue": 560312.45, "currentBalance": 560000, "targetAmount": 4000000, "progress": 14.0,
       "monthlyContribution": 56000, "nextContributionDate": "2026-07-01", "endDate": "2030-11-01",
       "interestRate": 14.5, "durationYears": 4.4, "status": "ACTIVE",
       "savingMode": { "id": "SOLO", "name": "On My Own" },
@@ -679,13 +860,21 @@ Returns `{ summary, filter, plans }`: a per-plan **summary list** (most recent f
 }
 ```
 
-Aggregates (across **all** plans): `totalBalance`/`totalProjectedValue`/`totalInterestEarned` are sums (null-safe → 0); `activePlans` = `ACTIVE`, `pendingPlans` = `PENDING_ACTIVATION`, `maturedPlans` = `COMPLETED`, `liquidatedPlans` = `CLOSED`; `overallProgress = totalBalance / Σ targetAmount`; `overallAPY` = current rate; `earningsAcrossPlans` = `totalInterestEarned`.
+Each plan carries both **`currentValue`** (live, grows daily) and **`currentBalance`** (compounding base) — see §6.9. Aggregates (across **all** plans): `totalBalance` is the sum of **`currentValue`** (so the dashboard total grows daily); `totalProjectedValue`/`totalInterestEarned` are sums (null-safe → 0); `activePlans` = `ACTIVE`, `pendingPlans` = `PENDING_ACTIVATION`, `maturedPlans` = `COMPLETED`, `liquidatedPlans` = `CLOSED`; `overallProgress = totalBalance / Σ targetAmount`; `overallAPY` = current rate; `earningsAcrossPlans` = `totalInterestEarned`.
+
+### 6.12 Cross-product portfolio — `GetSavingsPortfolioAllocation`
+
+Build Wealth participates in the shared **savings portfolio allocation** query (`Savings.getPortfolioAllocation`, alongside Burse Vault / Burse Flex / Target Savings). The `BUILD_WEALTH` product in `data.products[]` is populated from the user's wealth plans rather than the old hardcoded zero placeholder:
+
+- **Plans included:** `status ∈ { ACTIVE, COMPLETED }` — both still hold a balance (`CLOSED`/`PENDING_ACTIVATION` are excluded).
+- **`balance` / `percentage`:** the plans' **live value** (`balance + pendingInterest`, so it grows daily — §5.3), and its share of `totalSavings` (which now includes `wealthBalance`).
+- **`plans[]`:** one `SavingsPlanAllocation` per plan — `{ planId, planName, balance, percentage, interestRatePerAnnum (current APY), totalContributed, totalWithdrawn, totalInterestEarned, interestPercentage }`. Unlike the other products (which read `savingshistory`), these per-plan figures are aggregated from the **wealth ledger** (`wealthplantransactions`): contributed = `ACTIVATION`+`CONTRIBUTION` credits, withdrawn = `WITHDRAWAL` debits, interest = `INTEREST` credits.
+- **`changeLabel` / `changePercent`:** the product's lifetime interest (`wealthYield`) and its share of the portfolio-wide yield.
+- **Portfolio-level metrics:** wealth `INTEREST` credits are added to `interestEarnedThisMonth`/`allTimeInterestEarned` and `netProfitLoss{ThisMonth,ThisWeek,Today}`; wealth `WHT` debits are netted out of those profit figures. Wealth plans also feed the balance-weighted `averageYield` at the current APY.
 
 ### 6.11 Still planned
 
 - **GenerateWealthSimulation** — standalone projection (daily/weekly/monthly/yearly interest), independent of any persisted plan.
-- **Gift giving/accepting** endpoints (the `giftUrl`/`giftToken` plumbing already exists on the plan).
-- **Monthly interest compounding job** — interest still needs to mature monthly into the plan balance (and feed `totalInterestEarned`, which the exit WHT base prorates from). Until it lands, accrued interest is `0`, so exit WHT is `0`.
 - **Portfolio-backed loan ("Enjoy Life")** + loan-aware 30% cap + "no liquidation with outstanding loans" — a cross-module dependency (see §5.5), not built in this service.
 - **Exit notifications** — the FRD §7.6 reminder cadence (window-open notice; 3/2/1/0-day withdrawal countdown; 30/15/7/3/2/1/0-day "money is coming" reminders) is not wired yet.
 
@@ -717,6 +906,7 @@ Paystack helpers in [`paystack.ts`](src/services/classes/PaymentProcessors/payst
 The Paystack webhook ([`app.ts`](src/app.ts) → `verifyPaymentFromWebhook`) routes events to [`WealthPlanWebhookService`](src/services/wealth-plan-webhook.service.ts) **before** the default wallet-credit path when `metadata.purpose` starts with `build_wealth_`, the event is `direct_debit.authorization.*`, or (defensive fallback) the charge channel is `direct_debit`:
 
 - `charge.success` → credits the **plan** (never the wallet). Matches the plan by `metadata.planReference` → mandate `authorization_code` → `lastChargeReference`. **Idempotent** by ledger `reference`. Activates a `PENDING_ACTIVATION` plan; otherwise records a contribution (arrears when the purpose ends `_arrears` or the current cycle is already paid). Captures a reusable mandate/card `authorizationCode` when present. For direct-debit plans with arrears, chains the next arrears charge.
+  - **Gift charges** (`metadata.purpose = build_wealth_gift`, §6.8b) branch to `applyGiftCharge` instead: the gift is credited to the owner's wallet and then moved into the plan as a `CONTRIBUTION` (idempotent by the `BW-GIFT-<ref>` ledger reference).
 - `direct_debit.authorization.created|active` → stores the `authorizationCode` and sets `authorizationStatus` (`ACTIVE` when active) on the most recent `PENDING` direct-debit plan for that customer email.
 
 ### 7.3 Auto top-up cron + retry/arrears
@@ -746,6 +936,18 @@ Each settlement writes a **three-entry ledger set** whose amounts sum to the gro
 The plan balance drops by the **gross** — the charges are Burse's (fee revenue / WHT to remit / reabsorbed interest), not returned to the plan.
 
 Each settlement is wrapped in a Mongo transaction (`withTransaction`), so the wallet credit and the plan/ledger writes commit together. Flipping the request to `EXECUTED` makes the scan idempotent — a plan is settled at most once. Cancelled requests are never picked up (status ≠ `IN_MOTION`); the annual lock they leave behind is purely a read-side computation off `requestedAt` + `activatedAt` (§6.9), so no job is needed to "reopen" a window.
+
+### 7.3b Daily interest cron (daily accrual + monthly compounding)
+
+Job [`wealth-plan-daily-interest.ts`](src/jobs/wealth-plan-daily-interest.ts), scheduled daily (`EVERY_DAY_AT_MIDNIGHT_CRON`, alongside the other daily-interest jobs). It scans `ACTIVE` plans with a `nextInterestDate` set (backed by the `{ status, nextInterestDate }` index) and, for each, does two steps (§5.3):
+
+1. **Capitalize any due cycle(s) first** via `WealthPlanService.capitalizeMonthlyInterest`, catching up if several months are outstanding (bounded to 240 cycles), so today's accrual uses the fresh balance/cycle. Each capitalization is an **atomic, conditional** update (`nextInterestDate <= now` guard) that folds `pendingInterest` into `balance`, resets it to 0, and advances `nextInterestDate` — no new interest is recorded (already ledgered daily), so it never double-capitalizes. At term end it marks the plan `COMPLETED` (auto-save off, dates cleared).
+2. **Accrue today's slice** via `WealthPlanService.accrueDailyInterest` (skipped once the plan matured above): credits `balance × r ÷ daysInCycle` into `pendingInterest` **and** `totalInterestEarned`, and writes an `INTEREST` `CREDIT` ledger entry — in one Mongo transaction, **idempotent per day** via the deterministic reference `BW-INT-<plan>-<YYYY-MM-DD>`. `balance` is untouched (it only changes on capitalization).
+
+- Capitalization grows `balance`, which can cross `PROGRESS`/`SAVINGS_AMOUNT` milestones (§9.1), so milestones are re-checked after each capitalization.
+- Interest accrues normally even while a withdrawal/liquidation request is `IN_MOTION` (the FRD's "plan keeps earning during the notice window"). A growing `totalInterestEarned` sharpens the exit **WHT base** (§5.5).
+
+> Replaces the former monthly-only `wealth-plan-monthly-interest.ts` job (`applyMonthlyInterest`). The realized growth is the same monthly-compounding amount, but interest is now **visible daily** (daily ledger points → daily chart in §6.7d) instead of a single monthly jump.
 
 ### 7.4 Atomicity & reconciliation (no lost writes)
 
@@ -860,12 +1062,14 @@ Deeper view of one member's elite plan ([`single_elite_plan.png`]). Elite member
   "eliteSince": "2024-04-24T...",          // first became elite (not this plan)
   "status": "ACTIVE",
   "monthlyContribution": 500000, "targetAmount": 4000000,
-  "totalContributed": 3200000, "currentBalance": 3200000, "totalInterestEarned": 0,
-  "progress": 80, "streak": 47, "onTimePercentage": 100,
+  "totalContributed": 3200000, "currentValue": 3204200, "currentBalance": 3200000, "totalInterestEarned": 4200,
+  "progress": 80, "monthsToGoal": 2, "streak": 47, "onTimePercentage": 100,
   "mostRecentMilestone": { "title": "Crossed 80% complete", "type": "PROGRESS", "value": 80, "achievedAt": "..." },
   "milestones": [ { "title": "Crossed 80% complete", "type": "PROGRESS", "value": 80, "achievedAt": "..." } ]
 }
 ```
+
+**`monthsToGoal`** — estimated **months remaining** for the plan to reach its `targetAmount`, projecting the member's **current value** (`currentValue` = balance + accrued interest) forward at the recurring `monthlyContribution` and the current Build Wealth APY (so it reflects gifts/top-ups and accrued interest, consistent with `progress`). `0` once the target is met; `null` if it can never be reached at the current pace (e.g. no contribution set). Computed via the pure `monthsToReachTargetFrom` ([wealth-plan-calculator.ts](src/services/build-wealth/wealth-plan-calculator.ts)).
 
 ### 9.4 Cheers — `CheerEliteMember` / `RespondToCheer` ✅ (Mutations)
 
@@ -899,9 +1103,8 @@ The member's received cheers ([`respond_to_a_cheer.png`]), newest first, + unrea
 ### 9.6 Still planned (Elite Circle)
 
 - **Loan-aware** elite figures once the portfolio-backed loan lands.
-- **Monthly-interest compounding job** (the remaining large Build Wealth item) — credits monthly interest into the plan balance, feeds `totalInterestEarned` (which sharpens the exit WHT base and "interest earned" displays) and the true rate-renewal mechanics behind the anniversary milestone.
 
-> Plan-anniversary milestones and cheer notifications are **now implemented** (§9.1, §9.4).
+> Plan-anniversary milestones and cheer notifications are **now implemented** (§9.1, §9.4); monthly interest now compounds (§7.3b), so `totalInterestEarned` and on-plan "interest earned" are live.
 
 ---
 
@@ -909,6 +1112,15 @@ The member's received cheers ([`respond_to_a_cheer.png`]), newest first, + unrea
 
 | Date | Change |
 | --- | --- |
+| 2026-06-24 | **`futureCompoundingLost` on `PreviewWealthPlanWithdrawal`.** The withdrawal preview (§6.7b) now returns `futureCompoundingLost` — the future growth the withdrawn `grossAmount` would have earned had it stayed in the plan and compounded at the current APY until the plan's term end (`gross × ((1+r)^monthsRemaining − 1)`). Informational only (not deducted from `netToWallet`); surfaces the opportunity cost of withdrawing. Added the pure `futureCompoundingLost` calculator helper (+3 unit tests). Response is `data: JSON`, so no GraphQL schema change. |
+| 2026-06-24 | **Live value (`currentValue`) shown across wealth responses.** With interest now accruing daily but compounding monthly, the user-facing value would otherwise only step up at month-end. Added **`currentValue` = `balance + pendingInterest`** (= `totalContributed + totalInterestEarned`) — the headline "what my plan is worth", growing daily — to `GetWealthPlanDetails`, `GetAllWealthPlans` (per-plan + `summary.totalBalance` now sums it), the gift preview, and the Elite Circle list/member views; `GetSavingsPortfolioAllocation` counts Build Wealth at its live value too. Displayed **`progress`/`onTrackBalance`/`monthsToGoal`** are now computed from `currentValue`. **`currentBalance`** stays the compounding / withdrawable base (`balance`) that the **exit math** runs on — unchanged. No money-movement logic touched; 53 Build Wealth tests pass. |
+| 2026-06-24 | **Interest now accrues daily (monthly compounding).** Build Wealth previously only credited interest **once a month** (`wealth-plan-monthly-interest.ts` → `applyMonthlyInterest`), so `GetWealthPlanInterestEarned` showed `0`/empty for any plan under a month old and the chart only ever had monthly points. Reworked to the **daily-accrual / monthly-compounding** model (like Burse Vault's prorate-then-mature, but capitalizing instead of paying out): new daily job [`wealth-plan-daily-interest.ts`](src/jobs/wealth-plan-daily-interest.ts) (`EVERY_DAY_AT_MIDNIGHT_CRON`) **capitalizes** any due cycle (`capitalizeMonthlyInterest`, atomic `pendingInterest`→`balance`) then **accrues today's slice** (`accrueDailyInterest`: `balance × r ÷ daysInCycle` → `pendingInterest` + `totalInterestEarned` + a daily `INTEREST` ledger entry, idempotent per day `BW-INT-<plan>-<YYYY-MM-DD>`). Added a `pendingInterest` plan field (§5.1) surfaced on `GetWealthPlanDetails`, and the pure `dailyInterestAmount` calculator helper (a full cycle of slices sums to the monthly figure, so projections are unchanged; +3 unit tests, 53 Build Wealth tests pass). Rewrote §5.3/§7.3b; deleted the monthly job. **Diagnosis for BW140565:** not the endpoint and not a broken cron — the plan simply hadn't reached its first monthly maturity; it will now show interest from the first nightly run. |
+| 2026-06-24 | **`debitDay` as a labelled enum + `monthsToGoal` on the elite plan view.** (1) **`WealthDebitDay` enum** (`"1st" \| "5th" \| "10th" \| "15th" \| "20th" \| "25th" \| "last"`) replaces the raw-integer debit day across the API: `ToggleWealthPlanAutoSave.debitDay` is now a `String` label (GraphQL), validated and resolved to the stored integer (`"last"` → 31, clamped to the month's last day) via `DEBIT_DAY_LABEL_TO_NUMBER`; `GetWealthPlanDetails` (+ the toggle response) echo `debitDay` back as the label. The plan still **stores** an integer (§5.1) — only the wire format changed (§6.4, §6.9). (2) **`GetEliteMemberPlan` gained `monthsToGoal`** (§9.3) — estimated months remaining to hit the target, projecting current balance forward at the recurring contribution + current APY (`0` when met, `null` when unreachable). Added the pure `monthsToReachTargetFrom` calculator helper (+5 unit tests; 50 Build Wealth tests pass). Responses are `data: JSON`, so the only GraphQL schema change is the `debitDay` input type (`Int` → `String`). |
+| 2026-06-24 | **Missed-contribution dates + gift stats card.** (1) **`GetWealthPlanDetails.missedContributions`** changed from an integer count to an **array of display dates** (`"20th of June 2026"`), **most recent first** — the UI can now show *which* contributions were missed (§6.9). Added a `missedContributionDates: Date[]` plan field (§5.1): the missed cycle's scheduled date is appended in `registerFailedAttempt` when a miss is confirmed and the **oldest** is `$pop`-ed in `applyChargeWrites` as arrears recover, so it mirrors the existing `missedContributions` counter (now echoed as `missedContributionsCount` for badges/legacy plans). (2) **`GetWealthPlanGiftPreview`** gained a **`giftStats`** card — `{ giftsReceived, totalGifted (Naira), lastGiftDate (ISO\|null) }` — aggregated from the plan's `BW-GIFT-<ref>` ledger entries (§6.8a). Both endpoints return `data: JSON`, so no GraphQL schema change; 45 Build Wealth unit tests still pass. |
+| 2026-06-24 | **Build Wealth now appears in the cross-product `GetSavingsPortfolioAllocation`.** The `BUILD_WEALTH` product entry was a hardcoded `balance: 0 / plans: []` placeholder, so a user's wealth plans never showed in the savings portfolio (§6.12). `Savings.getPortfolioAllocation` now loads the user's `ACTIVE`/`COMPLETED` wealth plans (both still hold a balance) + current APY, sums them into `wealthBalance`/`totalSavings`/`averageYield`, and emits real per-plan allocations. Because Build Wealth keeps its own ledger (`wealthplantransactions`, not `savingshistory`), per-plan `totalContributed`/`totalWithdrawn`/`totalInterestEarned` are aggregated from that ledger (`ACTIVATION`+`CONTRIBUTION`, `WITHDRAWAL`, `INTEREST`), and wealth `INTEREST`/`WHT` are folded into the portfolio-wide `interestEarnedThisMonth`/`allTimeInterestEarned`/`netProfitLoss*` and the `changeLabel`/`changePercent` yield share. |
+| 2026-06-22 | **Elite Circle & VerifyWealthPlanCharge bug fixes.** (1) **Elite Circle queries no longer 500 with MongoError 31254.** `GetEliteMemberPlan`/`GetAllEliteCircleMembersWealthPlans` resolve member names via `User.find(query, "firstName lastName fullName")` (an **inclusion** projection); the User model's `excludePinHook` was adding `-pin` (an **exclusion**), and MongoDB rejects a mixed inclusion/exclusion projection (error 31254). The hook now **leaves inclusion projections untouched** (pin is already omitted by an inclusion projection) and only applies `-pin` to empty/exclusion projections — fixes every `User.find` with an inclusion projection app-wide (and the identical Employee hook). (2) **`VerifyWealthPlanCharge` short-circuits for non-Direct-Debit funding** — see §6.5: it no longer calls Paystack for `WALLET`/`CARD` or already-`ACTIVE` plans (their `BW-…` references are local-only and 400'd as "Transaction reference not found"). (3) Elite Circle API now logs expected `ServiceError` rejections (4xx) at **`warn`** instead of `error`. |
+| 2026-06-22 | **Endpoint fixes + gift flow, exit previews & interest chart.** **Fixes:** (1) `ToggleWealthPlanAutoSave` now accepts an **increase-only** `monthlyContribution` (rejects a reduction) and **validates `debitDay`** against `ALLOWED_DEBIT_DAYS` (1/5/10/15/20/25/31-last; `10000` etc. now rejected); its response echoes the updated `monthlyContribution`/`debitDay`. (2) `GetWealthPlanDetails`: `nextContributionDate` no longer returns `null` once a `debitDay` is set (falls back to deriving from `debitDay`), `debitDay`/`autoTopUp`/schedule fields are surfaced on the base/preview shape too (so a freshly-toggled debit day reflects immediately), and a new **`pendingContribution`** `{ amount, date, status }` was added. (3) `GetHealthyContribution` now returns **`interestRate`** (current APY). (4) Withdrawal/liquidation **request mutations** now call an explicit **`assertExitEligible`** hard gate (no exit before `activatedAt + 2yr`), independent of the window resolver. **New endpoints:** `PreviewWealthPlanWithdrawal(planId, amount?)` + `PreviewWealthPlanLiquidation(planId)` (by-plan exit previews with charges/fees + eventual balances + eligibility/window — §6.7b/c); `GetWealthPlanInterestEarned(input)` (interest chart, DAILY/WEEKLY/MONTHLY × THIS_MONTH/ALL_TIME — §6.7d); **public** `GiftWealthPlan(input)` (Paystack any-channel payment link, by `giftToken`) + `ProcessWealthPlanGift(reference)` (webhook fallback) — settlement credits the owner's wallet then moves the gift into the plan as a `CONTRIBUTION` (full trace, idempotent by `BW-GIFT-<ref>`), with the webhook routing `build_wealth_gift` charges to `applyGiftCharge` (§6.8b). Added `ALLOWED_DEBIT_DAYS`/`WEALTH_LAST_DAY_DEBIT` + interest/gift types. |
+| 2026-06-19 | **Monthly interest compounding + public gift preview.** (1) **Compounding job:** new `WealthPlanService.applyMonthlyInterest` + daily cron [`wealth-plan-monthly-interest.ts`](src/jobs/wealth-plan-monthly-interest.ts) (`EVERY_DAY_AT_2AM`) — credits `balance × r` (effective monthly rate, `monthlyInterestAmount`) into `balance` + `totalInterestEarned`, writes an `INTEREST` `CREDIT` entry, advances `nextInterestDate`, idempotent per cycle (`BW-INT-<plan>-<YYYY-MM>`), catches up missed months, and **matures the plan to `COMPLETED`** at term end (`activatedAt + durationMonths`, auto-save off). Added `{ status, nextInterestDate }` scan index; rewrote §5.3 (interest lives in `wealthplantransactions`, not the legacy `InterestModel`). Added a `monthlyInterestAmount` unit test. (2) **Public gift preview:** new **unauthenticated** `GetWealthPlanGiftPreview(giftToken)` (§6.8a) returning a curated, guest-safe subset keyed by the unguessable token — chosen over opening the owner-scoped, enumerable `GetWealthPlanDetails`. |
 | 2026-06-19 | **WHT remittance follow-ups + Elite Circle polish.** (1) **Savings WHT → `taxcollections`:** added `TaxService.recordWHTCollection()` (idempotent by `reference`) and wired it into all four savings WHT deduction points (Burse Flex + Burse Vault monthly in `payMonthlyInterest.ts`; Eazilock claim + maturity in `default-eazilock.service.ts`); added `SAVINGS_*` sources + a generic `sourceRef`. (2) **Remittance admin:** new `TaxCollectionService` + admin-authenticated `GetTaxCollections` (rows + outstanding summary) and `MarkTaxCollectionsRemitted` (selector-guarded `COLLECTED→REMITTED`) — §8.3. (3) **Cheer notifications:** `CheerEliteMember`/`RespondToCheer` now fire best-effort in-app + push notifications. (4) **Anniversary milestones:** new `ANNIVERSARY` milestone type + a daily calendar-based job (`wealth-plan-anniversary-milestones.ts`, `EVERY_DAY_AT_2AM`), decoupled from the pending interest job. The monthly-interest compounding job remains the main outstanding Build Wealth item. |
 | 2026-06-19 | **Elite Circle + WHT remittance.** (1) **WHT remittance:** split exit WHT into its own `WHT` ledger line and a dedicated **`taxcollections`** queue (`source`, `user`, `plan`, `taxableAmount`, `rate`, `amount`, unique `reference`, `status` COLLECTED→REMITTED) so the team can remit outstanding WHT (§8). `settleExit` now writes a three-entry set (PENALTY = forfeited+fee, WHT, WITHDRAWAL = net) atomically. Confirmed the rest of the app had **no** remittance table (savings WHT only narrated as `SavingsHistory` TAX entries). (2) **Streak & milestones:** added `contributionStreak` (resets to 0 on a miss) + lifetime `onTimeContributions` plan fields, and a **`wealthmilestones`** collection populated as contributions land via the pure, unit-tested `wealth-milestones.ts` (first contribution, 10/25/50/80/100% progress, ₦ landmarks, streak landmarks). (3) **Elite Circle module** (§9): membership = `ELITE_CIRCLE` + monthly ≥ ₦500k; new `EliteCircleService` + GraphQL — `GetAllEliteCircleMembersWealthPlans` (aggregates + ALL/MOST_PROGRESS/NEW_THIS_MONTH/LONGEST_STREAK filters), `GetEliteMemberPlan` (totals, on-time %, milestones, eliteSince), `CheerEliteMember` (≤60-char, no-digit note + emoji), `RespondToCheer`, `GetCircleInbox` (received cheers + unread). New `elitecheers` collection. Added `wealth-milestones.test.ts`. |
 | 2026-06-11 | Initial doc. Added Wealth Goals (`wealthgoals` schema, seeder, `GetAllWealthGoals` query) and `WealthSavingMode` enum (TS + GraphQL). Documented planned Create Wealth Plan shape. |
