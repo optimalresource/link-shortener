@@ -192,6 +192,37 @@ Schema: [`src/db/schema/build-wealth-setting.schema.ts`](src/db/schema/build-wea
 - **Read access:** [`BuildWealthSettingRepository.getInterestRate()`](src/db/repository/build-wealth-setting.repository.ts) returns the current rate (falls back to the default constant if unseeded). All interest math must read the rate through this — never hard-code `14.5`.
 - Default constant: `DEFAULT_BUILD_WEALTH_APY` in [`src/types/wealth-plan.ts`](src/types/wealth-plan.ts).
 
+> **Note:** the Build Wealth APY now also lives in the **interest-rate catalogue** (§4a), which is what plans resolve against. `buildwealthsettings` remains as the seed source / fallback for the Build Wealth `MONTHLY` rate.
+
+### 4a. Interest-rate catalogue (`interestrates`) — all savings products
+
+A **DB-backed, product-scoped** catalogue of interest rates, replacing hard-coded rate enums. **Seeded at deployment** (idempotent) to match the current configuration exactly, and admin-extensible thereafter. Schema: [`interest-rate.schema.ts`](src/db/schema/interest-rate.schema.ts). One record per **(product, interestType)**.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `product` | `String` | `BURSE_VAULT` \| `BUILD_WEALTH`. |
+| `name` | `String` | Display name, e.g. "Monthly", "End of Term". |
+| `interestType` | `String` | `MONTHLY` \| `ENDOFTERM` (admin may add more). |
+| `interestRate` | `Number` | Base/flat APY (%). Used directly when there are no `durationTiers`. |
+| `durationTiers` | `[{ minDays, maxDays, rate }]?` | Optional duration-based base rates (Burse Vault). Override `interestRate` when the plan's tenor matches. |
+| `amountTiers` | `[{ minAmount, maxAmount, rate }]?` | Optional amount-based **add-on** APY (Burse Vault). |
+| `amountTierMinMonths` | `Number?` | Amount tiers apply only past this many months (Vault legacy rule = 9). |
+| `isActive` | `Boolean` | Only active records are resolved/listed. |
+
+- **Seeder:** [`seed-interest-rates.ts`](src/scripts/seeds/seed-interest-rates.ts) upserts (`$setOnInsert`) — Burse Vault Monthly + End-of-Term with the live `EAZILOCK_INTEREST_SUMMARY_DAYS` duration tiers + `EAZILOCK_AMOUNT_TIER_RATES`; Build Wealth Monthly + End-of-Term flat at `DEFAULT_BUILD_WEALTH_APY` (14.5%). Admin edits are never overwritten.
+- **Resolution:** pure [`resolveRateFromRecord`](src/services/savings/interest-rate-resolver.ts) → tenor-band base (or flat) + amount add-on past `amountTierMinMonths`. `InterestRateRepository.resolveRate(...)` wraps it; returns `null` when unseeded so callers fall back safely. It **reproduces `getInterestRate(days, EAZILOCK)` exactly** (unit-tested).
+- **How each product uses it:**
+  - **Build Wealth** resolves its rate **live** by the plan's `interestType` (`WealthPlanService.resolveApy`), so an admin change flows to **existing** plans.
+  - **Burse Vault** reads the catalogue's Vault tiers via `SavingsInterestCalculatorService` (fallback to the config-service if unseeded) and **snapshots** the resolved rate onto the plan at creation, so a change only affects **new** plans; old plans keep their snapshot. (Vault End-of-Term still compounds into the vault balance — unchanged.)
+
+### 4b. `GetInterestRates` ✅ (Query)
+
+Lists the active catalogue, optionally scoped to one product. Authenticated. Powers the create-plan interest-type picker and admin views.
+
+**Input:** `GetInterestRates(product: String)` — `"BURSE_VAULT"` \| `"BUILD_WEALTH"`; omit for all.
+
+**Response** (`data`): a JSON array of `{ product, name, interestType, interestRate, durationTiers, amountTiers }`.
+
 ---
 
 ## 5. Wealth Plan data model
@@ -214,6 +245,7 @@ Schema: [`src/db/schema/wealth-plan.schema.ts`](src/db/schema/wealth-plan.schema
 | `durationMonths` | `Number` | Required. **Derived** at creation from `targetAmount` + `monthlyContribution` (source of truth). |
 | `durationYears` | `Number` | Required. Derived convenience value = `durationMonths / 12` (may be fractional). No longer user-supplied. |
 | `savingMode` | `WealthSavingMode` | `SOLO` \| `ELITE_CIRCLE`. |
+| `interestType` | `InterestTypeEnum` | `MONTHLY` (default) \| `ENDOFTERM`. Chosen at creation (optional); the plan's APY is resolved **live** from the interest-rate catalogue by this value, so an admin rate change flows to existing plans. Both types compound into the plan balance — only the rate differs. |
 | `status` | `WealthPlanStatus` | Default `PENDING_ACTIVATION`. |
 | `balance` | `Number` | Current total balance; monthly interest **compounds** into this. Default `0`. |
 | `totalContributed` | `Number` | Lifetime contributions. Default `0`. |
@@ -271,6 +303,8 @@ Indexes: `{ wealthPlan: 1, createdAt: -1 }`, `{ user: 1, createdAt: -1 }`. Repos
 ### 5.3 Interest model — daily accrual, monthly compounding
 
 Build Wealth **accrues interest daily** (so earnings grow every day, like Burse Vault) but **compounds it monthly** — the same prorate-then-mature shape as Burse Vault, except the matured interest is **capitalized into the plan** instead of paid to the wallet.
+
+> **Rate source.** The APY (`r`'s basis) is resolved **live** from the interest-rate catalogue (§4a) by the plan's **`interestType`** (`resolveApy`) — so an admin rate change flows to existing plans, and `MONTHLY` vs `ENDOFTERM` plans can carry different rates. It falls back to `buildwealthsettings` / `DEFAULT_BUILD_WEALTH_APY` if the catalogue is unseeded. (Both Build Wealth types compound into the balance identically; only the rate differs.)
 
 - **Daily accrual.** Each night the daily-interest job (§7.3b) credits one prorated slice — `balance × r ÷ daysInCycle` (`dailyInterestAmount`, where `r` is the effective monthly rate from the current APY and `daysInCycle` is the days in the maturing cycle) — into **`pendingInterest`** and **`totalInterestEarned`**, and writes an `INTEREST` `CREDIT` entry into `wealthplantransactions`. **`balance` is not touched**, so the slice doesn't compound until month-end. Accrues on the live `balance` (so a mid-cycle contribution lifts the daily slice). **Idempotent per day** via a deterministic reference (`BW-INT-<plan>-<YYYY-MM-DD>`).
 - **Monthly compounding (capitalization).** On `nextInterestDate` (set to `activatedAt + 1 month` at activation, then advanced a month each cycle) the accrued `pendingInterest` is **folded into `balance`** (reset to 0) so it begins to compound. This is an **atomic, conditional** balance move (no new interest is recorded — it was already ledgered + counted daily), so a re-run never double-capitalizes. Because the daily slices over a cycle sum to `balance × r`, the realized monthly growth (and the projections, §5.4) stay aligned with the original monthly model.
@@ -355,7 +389,7 @@ The early-exit/liquidation/withdrawal rules implement **`Build_Wealth_Exit_FRD_v
 
 ## 6. Wealth Plan endpoints
 
-Eleven **mutations** (`CreateWealthPlan`, `ActivateWealthPlan`, `TopUpWealthPlan`, `ToggleWealthPlanAutoSave`, `VerifyWealthPlanCharge`, `RequestWealthPlanWithdrawal`, `CancelWealthPlanWithdrawal`, `RequestWealthPlanLiquidation`, `CancelWealthPlanLiquidation`, `GiftWealthPlan`, `ProcessWealthPlanGift`) and ten read-only **queries** (`SimulateWealthPlan`, `GetHealthyContribution`, `GetWealthExitBreakdown`, `PreviewWealthPlanWithdrawal`, `PreviewWealthPlanLiquidation`, `GetWealthPlanInterestEarned`, `GetWealthPlanGiftPreview`, `PreviewWealthPlan`, `GetWealthPlanDetails`, `GetAllWealthPlans`). All return `Result!`; all require authentication **except `GetWealthPlanGiftPreview`, `GiftWealthPlan`, and `ProcessWealthPlanGift`**, which are public (gift flow — a gifter may be a guest, §6.8a / §6.12).
+Eleven **mutations** (`CreateWealthPlan`, `ActivateWealthPlan`, `TopUpWealthPlan`, `ToggleWealthPlanAutoSave`, `VerifyWealthPlanCharge`, `RequestWealthPlanWithdrawal`, `CancelWealthPlanWithdrawal`, `RequestWealthPlanLiquidation`, `CancelWealthPlanLiquidation`, `GiftWealthPlan`, `ProcessWealthPlanGift`) and ten read-only **queries** (`SimulateWealthPlan`, `GetHealthyContribution`, `GetWealthExitBreakdown`, `PreviewWealthPlanWithdrawal`, `PreviewWealthPlanLiquidation`, `GetWealthPlanInterestEarned`, `GetWealthPlanGiftPreview`, `PreviewWealthPlan`, `GetWealthPlanDetails`, `GetAllWealthPlans`). All return `Result!`; all require authentication **except `GetWealthPlanGiftPreview`, `GiftWealthPlan`, and `ProcessWealthPlanGift`** (public — gift flow, §6.8a / §6.12), and **`GetWealthPlanDetails`**, where the bearer token is **optional**: the owner gets the full view, a guest/non-owner gets the curated safe subset (§6.9).
 Resolvers: [`src/api/wealth-plan.api.ts`](src/api/wealth-plan.api.ts) · Service: [`src/services/wealth-plan.service.ts`](src/services/wealth-plan.service.ts) · TypeDefs: [`src/api/typeDefs/wealth-plan.ts`](src/api/typeDefs/wealth-plan.ts).
 
 `ActivateWealthPlan`, `TopUpWealthPlan`, `ToggleWealthPlanAutoSave`, `RequestWealthPlanWithdrawal`, and `RequestWealthPlanLiquidation` are guarded by the **email-verification** check (in [`src/api/index.ts`](src/api/index.ts) `EMAIL_VERIFIED_MUTATIONS`) since they can move money / set up debits; the two **request** mutations additionally validate the **transaction PIN**. `CreateWealthPlan`, `VerifyWealthPlanCharge`, and the two **cancel** mutations are not guarded (cancelling moves no money); the queries are pure reads.
@@ -375,16 +409,21 @@ Creates a **draft** plan (`PENDING_ACTIVATION`). No money moves. **No simulation
   "monthlyIncome": 3200000,
   "monthlyContribution": 750000,
   "targetAmount": 135000000,
-  "savingMode": "SOLO"                               // SOLO | ELITE_CIRCLE
+  "savingMode": "SOLO",                              // SOLO | ELITE_CIRCLE
+  "interestType": "MONTHLY"                          // optional: MONTHLY (default) | ENDOFTERM
 }
 ```
+
+> **`interestType` is optional** — `MONTHLY` (default) or `ENDOFTERM`. It selects which Build Wealth rate backs the plan (both compound into the balance; only the rate differs) and is stored on the plan; the APY is then resolved live from the interest-rate catalogue (§4a). Fetch the options via `GetInterestRates("BUILD_WEALTH")`.
 
 > **`durationYears` is no longer an input.** Duration is **derived** from `targetAmount` + `monthlyContribution` (see §5.4) and stored as `durationMonths` (+ `durationYears = durationMonths/12`).
 
 **Validation:**
 1. `goalIds` are uppercased + de-duplicated and checked against the **active** `wealthgoals` codes; unknown codes are rejected (`VALIDATION_ERROR`).
 2. `monthlyIncome`, `monthlyContribution`, `targetAmount` must be positive.
-3. `evaluatePlan(targetAmount, monthlyContribution, r)` must return `OK`. On `TOO_SLOW` / `TOO_FAST` / `INVALID` the create is rejected (`VALIDATION_ERROR`) with a guided message, e.g.:
+3. **Elite Circle minimum:** when `savingMode = ELITE_CIRCLE`, `monthlyContribution` must be **≥ ₦500,000** (`ELITE_MIN_MONTHLY_CONTRIBUTION`); otherwise the create is rejected (`VALIDATION_ERROR`) — _"Elite Circle plans require a monthly contribution of at least ₦500,000. Increase your contribution or choose the 'On My Own' saving mode."_ (This is the same gate Elite Circle membership uses, §9, enforced up front at creation.)
+4. **`interestType`** (optional) must be a valid type (`MONTHLY` \| `ENDOFTERM`); it defaults to `MONTHLY`. The plan's rate for the achievability check (`r`) uses the chosen type's APY.
+5. `evaluatePlan(targetAmount, monthlyContribution, r)` must return `OK`. On `TOO_SLOW` / `TOO_FAST` / `INVALID` the create is rejected (`VALIDATION_ERROR`) with a guided message, e.g.:
    - **TOO_SLOW:** _"On ₦750k monthly you can save up to ₦Xm in 20 years. To reach ₦135M, increase your monthly contribution to ₦Ym, or lower your target to ₦Xm."_
    - **TOO_FAST:** _"On ₦Xm monthly you'd reach ₦Ym in under 2 years. A plan must run at least 2 years — reduce your monthly contribution to ₦Zk, or raise your target."_
 
@@ -402,6 +441,28 @@ Creates a **draft** plan (`PENDING_ACTIVATION`). No money moves. **No simulation
 
 > `planId` is the plan's `planReference` — the identifier the activate/top-up endpoints expect.
 > `giftUrl` is a shareable link (gift-giving/accepting endpoints come later) built from an unguessable `giftToken`. Its root is **`BUILD_WEALTH_GIFT_BASE_URL`** (env), defaulting to `https://useburse.com`; set the env var per-environment to override.
+
+### 6.1a `GetPlanNameSuggestions` ✅ (Query)
+
+Powers the **"name your plan"** step of creation: the user can tap a suggested name instead of typing. Suggestions are derived from the **"why" — the wealth goals** the user selected. Authenticated, pure read.
+
+**Input:** `goalIds: [String!]!` — the selected wealth goal **codes** (the only field). Codes are uppercased + de-duplicated and matched against the **active** `wealthgoals`; unknown/inactive codes are ignored, but **at least one valid goal is required** (else `VALIDATION_ERROR`).
+
+**Response** (`data`): exactly **3** de-duplicated suggestions.
+
+```jsonc
+{
+  "goalIds": ["FINANCIAL_FREEDOM", "OWN_PROPERTY"],   // the valid goals used (input order)
+  "suggestions": ["Financial Freedom Fund", "My Dream Home", "Free By 50"]
+}
+```
+
+How names are produced (pure, [`wealth-plan-name-suggestions.ts`](src/services/build-wealth/wealth-plan-name-suggestions.ts)): names are derived **from each goal's `title` + `description`** (no per-code lookup), so **goals an admin adds later work automatically**:
+1. **Theme keywords** found in the goal **title** (then its **description**) pull in curated name ideas for that theme — e.g. _child / parents / wedding / car / education / health / travel / property / business / family / legacy / freedom / emergency / retirement / invest / wealth_. Title themes lead (the goal's headline drives the names), and more specific themes win over generic ones (so _"retire my parents"_ reads as a **parents** goal, not a retirement one).
+2. A name **derived from the title** is added as a personal option (strips the _"I want to …"_ preamble + trailing clause, title-cases the rest — e.g. _"I want to fund my podcast studio"_ → _"Fund My Podcast Studio"_).
+3. For a multi-goal selection the lists are **interleaved** (round-robin) for variety; the result is de-duplicated and padded with generic options (_"My Wealth Plan"_, …) so it always returns 3.
+
+These are only **suggestions** — `CreateWealthPlan` still accepts any `planName` the user types.
 
 ### 6.2 `ActivateWealthPlan` ✅
 
@@ -643,7 +704,7 @@ The interest-earned chart for a plan. Owner-scoped, pure read. Buckets the plan'
 
 A **guest-safe** preview for the gift-giving flow: someone following a share link may be a guest **without a Burse account** and still needs to see who/what they'd contribute toward. Keyed by the **unguessable `giftToken`** (16-byte hex) from the link — **not** the enumerable `planReference` — and returns only **non-sensitive** fields.
 
-> **Why a dedicated endpoint (not opening `GetWealthPlanDetails`).** `GetWealthPlanDetails` is owner-scoped and returns sensitive operational data (funding source, authorization status, debit day, withdrawal/liquidation windows, activity references) and is keyed by `planReference` (`BW######`, easily enumerable). Exposing it publicly would leak data and allow scraping. The gift preview instead requires the unguessable token and exposes a curated subset.
+> **Relationship to `GetWealthPlanDetails`.** `GetWealthPlanDetails` was made **bearer-token-optional** (2026-07-01, §6.9) so a not-logged-in gift-giver can open it directly — but only the **owner** (valid token) gets the full operational payload. A **guest/non-owner** receives the **same curated safe subset built here** (`buildGiftSafeView`), so the sensitive fields (funding source, authorization status, debit day, withdrawal/liquidation windows, activity references) never leak via the enumerable `planReference`. This endpoint remains the canonical **token-keyed** entry point for the gift flow (keyed by the unguessable `giftToken`, and it doesn't require a `planReference` the gifter may not know).
 
 **Input:** `giftToken: String!`. **Response** (`data`):
 
@@ -742,9 +803,11 @@ Rich, computed view of an **owned** plan — intended for a `PENDING_ACTIVATION`
 }
 ```
 
-### 6.9 `GetWealthPlanDetails` ✅ (Query)
+### 6.9 `GetWealthPlanDetails` ✅ (Query — **bearer token optional**)
 
-Full details for an **ACTIVE** plan = the preview fields **plus live progress, recent activity, and action/state flags**. For a non-active plan it returns the **preview shape** (the `status` field conveys `PENDING_ACTIVATION`). Owner-scoped.
+Full details for an **ACTIVE** plan = the preview fields **plus live progress, recent activity, and action/state flags**. For a non-active plan it returns the **preview shape** (the `status` field conveys `PENDING_ACTIVATION`).
+
+> **Auth: optional bearer token (owner vs guest).** The endpoint no longer *requires* a token, so a not-logged-in gift-giver can open a plan via its gift link. The resolver authenticates **opportunistically**: if a valid token is present **and** the caller owns the plan (`plan.user === userId`) it returns the **full owner view** below; otherwise (no token, or a token for a different user) it returns the **curated safe subset** — the same shape as `GetWealthPlanGiftPreview` (§6.8a), built by the shared `buildGiftSafeView` helper. This keeps the sensitive operational fields (funding source, authorization status, debit day, withdrawal/liquidation windows, income, activity references) from leaking via the **enumerable `planReference`** while still meeting the "no login needed to see plan details for gifting" requirement; the frontend controls what it renders using the gift-link params.
 
 **Input:** `planId: ID!`. Active responses add (on top of the preview fields):
 
@@ -765,6 +828,8 @@ Full details for an **ACTIVE** plan = the preview fields **plus live progress, r
   "autoTopUp": true, "topUpEnabled": true, "debitDay": "1st", // WealthDebitDay label ("1st"…"25th" | "last")
   "missedContributions": ["20th of June 2026", "20th of May 2026"], // display dates, most recent first
   "missedContributionsCount": 2,                                     // raw tally (badges / legacy plans)
+  "giftStats": { "giftsReceived": 12, "totalGifted": 480000, "lastGiftDate": "2026-06-20T09:14:00.000Z" }, // gifts received on this plan (§6.8a)
+  "unreadEliteCircleActivityCount": 3,                               // unread Elite Circle cheers/messages for the owner — action badge (§9)
   "recentActivity": [
     { "date": "2026-05-25", "type": "CONTRIBUTION", "amount": 56000, "description": "Monthly contribution", "reference": "...", "balance": 560000 }
   ],
@@ -819,6 +884,8 @@ Convenience booleans `windowOpen` / `inMotion` mirror `status`; `canRequest` / `
 - **`debitDay`** — returned as a **`WealthDebitDay` label** (`"1st" | "5th" | "10th" | "15th" | "20th" | "25th" | "last"`), `null` when no debit day is set — **not** the raw integer. This is the same label `ToggleWealthPlanAutoSave` accepts, so the value round-trips. (`"last"` is stored internally as 31 and clamped to the month's actual last day at charge time.)
 - **`pendingContribution`** — `{ amount, date, status }` for the next scheduled contribution. `status`: `SCHEDULED` (auto-save on, on track), `RETRYING` (a charge is in its 3-day retry window), `ARREARS` (missed months awaiting recovery), or `NOT_SCHEDULED` (auto-save off). `amount` = `monthlyContribution`; `date` = `nextContributionDate`.
 - **`missedContributions`** — an **array of display dates** (`"20th of June 2026"`), **most recent first**, one per contribution confirmed missed (after the 3-day retry window). Each missed cycle's originally-scheduled date is recorded on the plan (`missedContributionDates`) when the miss is registered and the **oldest** is removed as arrears are recovered, so the list mirrors the outstanding misses. `missedContributionsCount` carries the raw integer tally (for a count badge, and for **legacy plans** created before this field — their array is empty until a new miss is recorded). Previously this field was the integer count itself.
+- **`giftStats`** — gifts received on this plan so far: `{ giftsReceived, totalGifted (Naira), lastGiftDate (ISO | null) }`, aggregated from the plan's `BW-GIFT-<ref>` ledger entries (same shape as the gift preview, §6.8a).
+- **`unreadEliteCircleActivityCount`** — the owner's count of **unread Elite Circle activity** (received cheers/messages) for the action badge; naturally `0` for a non-elite owner. The same field is returned by the Elite Circle endpoints (§9), and `MarkEliteCircleActivityRead` (§9.4) clears it.
 
 **Business rules (Build Wealth Exit FRD, see §5.5).**
 
@@ -868,7 +935,7 @@ Build Wealth participates in the shared **savings portfolio allocation** query (
 
 - **Plans included:** `status ∈ { ACTIVE, COMPLETED }` — both still hold a balance (`CLOSED`/`PENDING_ACTIVATION` are excluded).
 - **`balance` / `percentage`:** the plans' **live value** (`balance + pendingInterest`, so it grows daily — §5.3), and its share of `totalSavings` (which now includes `wealthBalance`).
-- **`plans[]`:** one `SavingsPlanAllocation` per plan — `{ planId, planName, balance, percentage, interestRatePerAnnum (current APY), totalContributed, totalWithdrawn, totalInterestEarned, interestPercentage }`. Unlike the other products (which read `savingshistory`), these per-plan figures are aggregated from the **wealth ledger** (`wealthplantransactions`): contributed = `ACTIVATION`+`CONTRIBUTION` credits, withdrawn = `WITHDRAWAL` debits, interest = `INTEREST` credits.
+- **`plans[]`:** one `SavingsPlanAllocation` per plan — `{ planId, planName, balance, percentage, interestRatePerAnnum (current APY), totalContributed, totalWithdrawn, totalInterestEarned, interestPercentage }`. Unlike the other products (which read `savingshistory`), these per-plan figures are aggregated from the **wealth ledger** (`wealthplantransactions`): contributed = `ACTIVATION`+`CONTRIBUTION` credits, withdrawn = `WITHDRAWAL` debits, interest = `INTEREST` credits. `SavingsPlanAllocation.planName` is non-nullable, so it **falls back to the plan's `planReference`** if a plan is missing a name (legacy/manually-inserted data) rather than nulling the whole response.
 - **`changeLabel` / `changePercent`:** the product's lifetime interest (`wealthYield`) and its share of the portfolio-wide yield.
 - **Portfolio-level metrics:** wealth `INTEREST` credits are added to `interestEarnedThisMonth`/`allTimeInterestEarned` and `netProfitLoss{ThisMonth,ThisWeek,Today}`; wealth `WHT` debits are netted out of those profit figures. Wealth plans also feed the balance-weighted `averageYield` at the current APY.
 
@@ -889,25 +956,54 @@ Build Wealth contributions are **auto-debited** from the source the user authori
 | Source | Authorization | Recurring charge |
 | --- | --- | --- |
 | `WALLET` | None (status `ACTIVE` immediately) | `debitUsersWallet` |
-| `CARD` | Saved, tokenised card (`card.token`) | Paystack `chargeAuthorization` |
-| `BANK_TRANSFER` | **Paystack Direct Debit mandate** (`authorizationCode`, status `PENDING → ACTIVE`) | Paystack `chargeAuthorization` against the mandate (async) |
+| `CARD` | Saved, tokenised card (`card.token`) — shared `cards` store (§7.1a) | Paystack `chargeAuthorization` |
+| `BANK_TRANSFER` | **Paystack Direct Debit mandate** (`authorizationCode`, status `PENDING → ACTIVE`) — also in the shared `bankMandates` store (§7.1a) | Paystack `chargeAuthorization` against the mandate (async) |
+
+> **Going forward (product-agnostic payment layer, §7.1a):** cards and bank mandates are stored **per user, not per plan**, and every savings product charges them via `chargeAuthorization(token)`. Build Wealth's `BANK_TRANSFER` still captures its mandate at activation, but the same mandate now also lands in the shared `bankMandates` store, so other products get Direct Debit "for free".
 
 ### 7.1 Direct Debit (Paystack) — reference `Paystack_Direct_Debit.md`
 
 Paystack helpers in [`paystack.ts`](src/services/classes/PaymentProcessors/paystack.ts):
 - `initializeDirectDebit({ email, amount, metadata })` — `channels:['bank']` + `metadata.custom_filters.recurring=true`; returns the authorization URL (collect first payment **and** create a mandate in one step). Used by activation + one-off direct-debit top-ups.
-- `initializeAuthorization({ email })` — mandate-only request (`channel:'direct_debit'`); returns a `redirectUrl`. Used by `ToggleWealthPlanAutoSave` when enabling Direct Debit without an existing mandate.
-- `verifyAuthorization(reference)` — confirms a mandate and returns the reusable `authorizationCode` + active flag.
+- `initializeAuthorization({ email, phone?, account?, address? })` — mandate-only request (`channel:'direct_debit'`); returns a `redirectUrl`. Optional **account + address + phone prefill** lets the consent page skip straight to OTP. Used by `ToggleWealthPlanAutoSave` **and** the product-agnostic `InitiateDirectDebit` (§7.1a).
+- `verifyAuthorization(reference)` — confirms a mandate and returns the reusable `authorizationCode` + active flag. A `404 "Authorization does not exist…"` is Paystack's documented *"pending, try again later"* signal, not an error.
+- `chargeCard` / `submitPin` / `submitOtp` — the raw-card **Charge API** multi-step (used by the direct add-card path, §7.1a).
+
+> **Feature gate:** Direct Debit is a Nigeria-only Paystack feature that must be **enabled per merchant account**. If the `bank` channel isn't provisioned, Paystack returns `"No active channel to process transaction"`. Mandate activation events reach us only via webhook (below) — so on `localhost` (no public URL) a mandate stays `PENDING` until re-verified with `VerifyDirectDebit`/reconciliation; use a tunnel to receive the `direct_debit.authorization.active` event live.
+
+### 7.1a Product-agnostic payment instruments — cards & bank mandates (used by every savings product)
+
+Payment instruments live **per user, not per plan**. Any savings product (Build Wealth, Emergency Fund, EaziLock, Investment, …) charges the same saved card or bank mandate through `chargeAuthorization(token)` — a product stores only a *reference* to the instrument (or resolves the user's default), never its own copy. This is the single source of truth going forward.
+
+**Saved cards — `cards` collection** ([`cards.ts`](src/models/cards.ts)). `card.token` is the reusable Paystack `authorization_code`; saved idempotently on (user + bin + last4 + expiry) by [`save-card-from-paystack.ts`](src/helpers/save-card-from-paystack.ts). Two ways to add a card:
+- **Inline (recommended, PCI-light — the production path):** `InitiateAddCard` **now also returns `accessCode`** so the client drives Paystack Inline JS `resumeTransaction` (card entered in Paystack's secure iframe on our page, no full redirect) → `VerifyAddCard(reference)` verifies + saves (idempotent with the webhook; returns `PENDING` to poll). A ₦100 tokenisation charge (`ADD_CARD_CHARGE_AMOUNT`).
+- **Direct / Charge API (SAQ-D — sandbox/testing only):** `AddCardDirect(input)` posts raw card fields to our backend → Paystack `POST /charge`, returning a multi-step `status` (`send_pin` → `SubmitCardPin`, `send_otp` → `SubmitCardOtp`, `open_url` → 3-D Secure) until `success`, then saves the card. It handles raw PAN/CVV, so it is a **test-harness** path, not for production.
+- Management + charge: `ListCards`, `UpdateDefaultCard`, `DeleteCard`; **`ChargeSavedCard(cardId, amount)`** charges a saved card on demand (`metadata.purpose = card_charge`).
+
+**Bank mandates — `bankMandates` collection** ([`bank-mandate.ts`](src/models/bank-mandate.ts)), the Direct-Debit mirror of `cards`. `mandate.authorizationCode` is the reusable Paystack direct-debit authorization; `status` `PENDING → ACTIVE`; saved idempotently on (user + `authorizationCode`) by [`save-mandate-from-paystack.ts`](src/helpers/save-mandate-from-paystack.ts). Service [`DirectDebitService`](src/services/classes/direct-debit.ts) (`directDebitFactory`), endpoints all auth + BVN-gated:
+- `ListSupportedDirectDebitBanks` — Paystack's Direct-Debit bank list (name + code).
+- `InitiateDirectDebit({ accountNumber, bankCode, address:{state,city,street}, phone? })` — prefilled `initializeAuthorization`; persists a `PENDING` mandate stub; returns `{ redirectUrl, reference }` (client renders the consent inline / in a tab).
+- `VerifyDirectDebit(reference)` — `verifyAuthorization`; on an `authorizationCode` saves/activates the mandate; returns `PENDING` to poll (activation — the ₦50 NIBSS validation — can take up to 24h).
+- `ChargeBankAccount(mandateId, amount)` — `chargeAuthorization` against the mandate (`metadata.purpose = direct_debit_charge`).
+- `ListBankAccounts`, `SetDefaultBankAccount`, `DeleteBankAccount`.
+
+**How Build Wealth relates.** `BANK_TRANSFER` still captures a mandate at activation and stores its `authorizationCode` on the plan (§5.1) for the recurring charge — unchanged. But the **same mandate now also lands in `bankMandates`** via the webhook (§7.2), so a plan can resolve the user's mandate from the shared store instead of holding its own copy, and other products inherit Direct Debit without new plumbing.
+
+> A throwaway Next.js harness — [`paystack-sandbox/`](paystack-sandbox/) — exercises all of the above end-to-end (login → add card inline/direct → link a bank mandate → charge either).
 
 ### 7.2 Webhook handling
 
 **Every Build Wealth Paystack charge carries `metadata.purpose = build_wealth_*`** (`build_wealth_activation` / `build_wealth_topup` / `build_wealth_autodebit` / `build_wealth_autodebit_arrears`) plus `planReference` — passed to `initializeDirectDebit` **and** `chargeAuthorization` (recurring charges). This makes webhook routing **metadata-driven**, not a guess.
 
-The Paystack webhook ([`app.ts`](src/app.ts) → `verifyPaymentFromWebhook`) routes events to [`WealthPlanWebhookService`](src/services/wealth-plan-webhook.service.ts) **before** the default wallet-credit path when `metadata.purpose` starts with `build_wealth_`, the event is `direct_debit.authorization.*`, or (defensive fallback) the charge channel is `direct_debit`:
+The Paystack webhook ([`app.ts`](src/app.ts) → `verifyPaymentFromWebhook`) fans events out **before** the default wallet-credit path. After the product-agnostic split (§7.1a), routing is **purpose-driven** (covered by [`tests/services/paystack-webhook-routing.test.ts`](tests/services/paystack-webhook-routing.test.ts)):
 
-- `charge.success` → credits the **plan** (never the wallet). Matches the plan by `metadata.planReference` → mandate `authorization_code` → `lastChargeReference`. **Idempotent** by ledger `reference`. Activates a `PENDING_ACTIVATION` plan; otherwise records a contribution (arrears when the purpose ends `_arrears` or the current cycle is already paid). Captures a reusable mandate/card `authorizationCode` when present. For direct-debit plans with arrears, chains the next arrears charge.
-  - **Gift charges** (`metadata.purpose = build_wealth_gift`, §6.8b) branch to `applyGiftCharge` instead: the gift is credited to the owner's wallet and then moved into the plan as a `CONTRIBUTION` (idempotent by the `BW-GIFT-<ref>` ledger reference).
-- `direct_debit.authorization.created|active` → stores the `authorizationCode` and sets `authorizationStatus` (`ACTIVE` when active) on the most recent `PENDING` direct-debit plan for that customer email.
+- **`direct_debit.authorization.created|active`** → **first** persists/activates the product-agnostic mandate in `bankMandates` (`saveBankMandateFromPaystack`, owner resolved by customer email), **then** still notifies [`WealthPlanWebhookService`](src/services/wealth-plan-webhook.service.ts) so an activating Build Wealth plan captures the same `authorizationCode` on the plan. Purely additive — no Build Wealth regression.
+- **`charge.success`** routes to Build Wealth **only** when `metadata.purpose` starts with `build_wealth_` **or** the direct-debit charge carries **no purpose** (Build Wealth's own recurring charges are unlabelled). It credits the **plan** (never the wallet): matches by `metadata.planReference` → mandate `authorization_code` → `lastChargeReference`; **idempotent** by ledger `reference`; activates a `PENDING_ACTIVATION` plan, else records a contribution (arrears when the purpose ends `_arrears` or the cycle is already paid); chains the next arrears charge for direct-debit plans.
+  - **Gift charges** (`metadata.purpose = build_wealth_gift`, §6.8b) branch to `applyGiftCharge` instead: credited to the owner's wallet then moved into the plan as a `CONTRIBUTION` (idempotent by `BW-GIFT-<ref>`).
+- **Generic, product-agnostic charges** tag their own purpose so they are **not** mistaken for a Build Wealth recurring charge:
+  - `add_card` → save the card (`saveCardFromPaystackAuthorization`), skip the wallet.
+  - `direct_debit_setup` (frontend-initialized `transaction/initialize`) → persist the mandate from the transaction's authorization (guarded to a `direct_debit`-channel auth), skip the wallet.
+  - `direct_debit_charge` / `card_charge` (the `ChargeBankAccount` / `ChargeSavedCard` test-triggers) fall through to the normal money-in path.
 
 ### 7.3 Auto top-up cron + retry/arrears
 
@@ -1035,13 +1131,14 @@ The Elite Circle dashboard ([`elite_dashboard.png`]): aggregate metrics + the fi
   "averageProgressOfElites": 47,                        // avg progress % across ACTIVE elite plans
   "totalEliteMembers": 12,                              // distinct members
   "totalElitePlans": 12,
+  "unreadEliteCircleActivityCount": 3,                  // viewer's unread cheers/messages — action badge (§9.4)
   "filter": "ALL",
   "elitePlanList": [
     {
       "planId": "BW123456", "planTitle": "Freedom at 45",
       "memberId": "...", "memberName": "Olamide Oladehinde", "isYou": true,
       "monthlyContribution": 500000, "targetAmount": 15000000,
-      "currentBalance": 1802481, "progress": 20, "streak": 47,
+      "currentValue": 1803051, "currentBalance": 1802481, "progress": 20, "streak": 47,
       "activatedAt": "2024-04-24T...",
       "recentMilestone": { "title": "Crossed 80% complete", "type": "PROGRESS", "achievedAt": "2026-06-15T..." }
     }
@@ -1065,20 +1162,26 @@ Deeper view of one member's elite plan ([`single_elite_plan.png`]). Elite member
   "totalContributed": 3200000, "currentValue": 3204200, "currentBalance": 3200000, "totalInterestEarned": 4200,
   "progress": 80, "monthsToGoal": 2, "streak": 47, "onTimePercentage": 100,
   "mostRecentMilestone": { "title": "Crossed 80% complete", "type": "PROGRESS", "value": 80, "achievedAt": "..." },
-  "milestones": [ { "title": "Crossed 80% complete", "type": "PROGRESS", "value": 80, "achievedAt": "..." } ]
+  "milestones": [ { "title": "Crossed 80% complete", "type": "PROGRESS", "value": 80, "achievedAt": "..." } ],
+  "unreadEliteCircleActivityCount": 3       // viewer's unread cheers/messages — action badge (§9.4)
 }
 ```
 
 **`monthsToGoal`** — estimated **months remaining** for the plan to reach its `targetAmount`, projecting the member's **current value** (`currentValue` = balance + accrued interest) forward at the recurring `monthlyContribution` and the current Build Wealth APY (so it reflects gifts/top-ups and accrued interest, consistent with `progress`). `0` once the target is met; `null` if it can never be reached at the current pace (e.g. no contribution set). Computed via the pure `monthsToReachTargetFrom` ([wealth-plan-calculator.ts](src/services/build-wealth/wealth-plan-calculator.ts)).
 
-### 9.4 Cheers — `CheerEliteMember` / `RespondToCheer` ✅ (Mutations)
+### 9.4 Cheers — `CheerEliteMember` / `RespondToCheer` / `MarkEliteCircleActivityRead` ✅ (Mutations)
 
 Stored in the **`elitecheers`** collection ([schema](src/db/schema/elite-cheer.schema.ts)): `{ fromUser, toUser, wealthPlan, message, emoji, responseEmoji, respondedAt, isRead }`.
 
 - **`CheerEliteMember`** (`{ planId, message?, emoji }`) — cheer the member who owns `planId` ([`cheer_an_elite.png`]). Both parties must be elite; you can't cheer your own plan. **Message rules (circle = kind notes only):** optional, **≤ 60 chars**, and **no digits** (`VALIDATION_ERROR` otherwise); `emoji` required (the UI offers 👏 🔥 💪 🙌 ✨ 🚀, any single emoji accepted). Returns `{ cheerId, toMemberName, note, emoji }`.
 - **`RespondToCheer`** (`{ cheerId, emoji }`) — the recipient replies with an emoji ([`respond_to_a_cheer.png`]); only the cheer's `toUser` may respond. Marks the cheer read. Returns `{ cheerId, responseEmoji }`.
+- **`MarkEliteCircleActivityRead`** (`{ cheerIds? }`) — marks the caller's **received** cheers as read, clearing the **activity badge**. Omit `cheerIds` (or pass `[]`) to mark the **whole inbox** read; pass specific ids to mark only those (only cheers addressed to the caller are affected). Idempotent. Returns `{ marked, unreadEliteCircleActivityCount }` so the badge refreshes in one call.
 
-> **Notifications.** Both actions fire a **best-effort in-app + push notification** (via `notificationFactory`/`pushNotificationFactory`): the recipient is notified of a new cheer; the original sender is notified when their cheer gets a reply. Delivery failures are swallowed — they never block the cheer/response.
+#### Activity badge — `unreadEliteCircleActivityCount`
+
+The count of the caller's **unread received cheers/messages** (`elitecheers.toUser = caller, isRead = false`). It's returned by **every** Elite Circle read endpoint (`GetAllEliteCircleMembersWealthPlans`, `GetEliteMemberPlan`, `GetCircleInbox`) **and by `GetWealthPlanDetails`** (§6.9), so the UI can show the badge on the plan screen and the circle. A cheer becomes read when the recipient calls `MarkEliteCircleActivityRead` **or** replies via `RespondToCheer`. Naturally `0` for a non-elite user (they receive no cheers).
+
+> **Notifications.** Cheer/response actions fire a **best-effort in-app + push notification** (via `notificationFactory`/`pushNotificationFactory`): the recipient is notified of a new cheer; the original sender is notified when their cheer gets a reply. Delivery failures are swallowed — they never block the cheer/response.
 
 ### 9.5 `GetCircleInbox` ✅ (Query)
 
@@ -1088,7 +1191,9 @@ The member's received cheers ([`respond_to_a_cheer.png`]), newest first, + unrea
 
 ```jsonc
 {
-  "unreadCount": 2, "filter": "ALL", "total": 12,
+  "unreadCount": 2,                          // received cheers not yet read
+  "unreadEliteCircleActivityCount": 2,       // same value under the shared badge field name (§9.4)
+  "filter": "ALL", "total": 12,
   "cheers": [
     {
       "cheerId": "...", "fromMemberId": "...", "fromMemberName": "Olamide Oladehinde",
@@ -1112,6 +1217,11 @@ The member's received cheers ([`respond_to_a_cheer.png`]), newest first, + unrea
 
 | Date | Change |
 | --- | --- |
+| 2026-07-02 | **Product-agnostic Paystack payment layer — unified add-card + Direct Debit (§7, §7.1a).** Payment instruments are now stored **per user, not per plan**, so every savings product charges the same saved card/bank mandate via `chargeAuthorization(token)`. (1) **Bank mandates:** new **`bankMandates`** collection ([bank-mandate.ts](src/models/bank-mandate.ts)) mirroring `cards`, idempotent save helper ([save-mandate-from-paystack.ts](src/helpers/save-mandate-from-paystack.ts)), and a **`DirectDebitService`** ([direct-debit.ts](src/services/classes/direct-debit.ts)) exposing `InitiateDirectDebit` (prefilled account/address/**phone**) / `VerifyDirectDebit` / `ListBankAccounts` / `ListSupportedDirectDebitBanks` / `ChargeBankAccount` / `SetDefaultBankAccount` / `DeleteBankAccount`. (2) **Add card unified:** `InitiateAddCard` now also returns **`accessCode`** for inline Paystack JS (`resumeTransaction`, no redirect); added the raw-card **Charge API** path `AddCardDirect` / `SubmitCardPin` / `SubmitCardOtp` (SAQ-D, sandbox only) + a standalone `ChargeSavedCard`. (3) **Webhook decoupled** ([paystack.ts](src/services/classes/PaymentProcessors/paystack.ts) `verifyPaymentFromWebhook`): `direct_debit.authorization.*` now persists to `bankMandates` **and** still notifies Build Wealth (no regression); `charge.success` routes to Build Wealth only for `build_wealth_*`/unlabelled charges, while `add_card` / `direct_debit_setup` / `direct_debit_charge` / `card_charge` are handled by the generic path. Build Wealth's `BANK_TRANSFER` is unchanged but its mandate now also lands in the shared store. New `tests/services/paystack-webhook-routing.test.ts` (7 branch tests) pins the routing; backend typecheck clean. A throwaway [`paystack-sandbox/`](paystack-sandbox/) Next.js harness drives the whole surface. |
+| 2026-07-01 | **`GetWealthPlanDetails` made bearer-token-optional (owner vs guest).** So a not-logged-in gift-giver can open a plan via its gift link, the query no longer *requires* auth (§6.9). The resolver now authenticates **opportunistically**: an owner (valid token, `plan.user === userId`) still gets the full detailed/preview view; a **guest or non-owner** gets the **curated safe subset** — the same shape as `GetWealthPlanGiftPreview` (§6.8a), extracted into a shared `buildGiftSafeView` helper (name, owner first name, goals, target, live value, progress, rate, giftStats/giftUrl — **no** funding source, authorization status, debit day, withdrawal/liquidation windows, income, or activity). This meets the "no login to view for gifting" need **without** leaking operational data through the enumerable `planReference`; the frontend controls display via the gift-link params. Service lookup is now by `planReference` only (`getPlanByReference`) with ownership decided in code. 65 Build Wealth tests pass; typecheck clean. |
+| 2026-06-24 | **DB-backed interest-rate catalogue (both products) + Build Wealth interest type.** Introduced a product-scoped **`interestrates`** catalogue ([interest-rate.schema.ts](src/db/schema/interest-rate.schema.ts)): `{ product (BURSE_VAULT \| BUILD_WEALTH), name, interestType (MONTHLY \| ENDOFTERM), interestRate, durationTiers?, amountTiers?, amountTierMinMonths?, isActive }`, replacing hard-coded rate enums. **Seeded at deployment** (idempotent, [seed-interest-rates.ts](src/scripts/seeds/seed-interest-rates.ts)) to **match the current config exactly** — Burse Vault Monthly/End-of-Term carry the live `EAZILOCK_INTEREST_SUMMARY_DAYS` duration tiers + `EAZILOCK_AMOUNT_TIER_RATES` (past 9 months); Build Wealth Monthly/End-of-Term are flat at 14.5%. The pure [`resolveRateFromRecord`](src/services/savings/interest-rate-resolver.ts) reproduces `getInterestRate(days, EAZILOCK)` exactly (unit-tested). **Build Wealth** (§5.3, §6.1): plans gain an optional **`interestType`** (default `MONTHLY`) chosen at creation and stored on the plan; its APY is resolved **live** from the catalogue (`resolveApy`), so an admin rate change flows to existing plans, and it's surfaced as `interestTypeCode` + drives `interestRate`/projections per plan. **Burse Vault**: `SavingsInterestCalculatorService` now reads the catalogue's Vault tiers (fallback to config-service if unseeded), so **new** plans take the catalogue rate (admin-editable) while **old** plans keep their snapshot; End-of-Term still compounds into the vault (unchanged). New query **`GetInterestRates(product?)`** (§4a) lists the catalogue. Both products now use their own DB-backed rates. 120 tests pass (incl. Vault-parity + resolver); typecheck clean. |
+| 2026-06-24 | **Plan-name suggestions + Elite Circle minimum at creation.** (1) New query **`GetPlanNameSuggestions(goalIds)`** (§6.1a) returns **3** plan-name suggestions derived from the selected wealth goals. Names are generated **from each goal's `title` + `description`** (theme-keyword matching, title themes prioritised, specific-over-generic) — no per-code lookup, so **admin-added goals work automatically** — with a title-derived personal option, round-robin interleaving across goals, and generic padding. Pure [`wealth-plan-name-suggestions.ts`](src/services/build-wealth/wealth-plan-name-suggestions.ts) (+9 unit tests). (2) **`CreateWealthPlan`** now enforces the **Elite Circle minimum** up front: `savingMode = ELITE_CIRCLE` requires `monthlyContribution ≥ ₦500,000` (`ELITE_MIN_MONTHLY_CONTRIBUTION`), else `VALIDATION_ERROR` (§6.1). 63 Build Wealth tests pass; typecheck clean. |
+| 2026-06-24 | **Elite Circle activity badge + gift stats on plan details.** (1) **`unreadEliteCircleActivityCount`** (count of the viewer's unread received cheers/messages) is now returned by `GetWealthPlanDetails` (§6.9) **and** every Elite Circle read endpoint (`GetAllEliteCircleMembersWealthPlans`, `GetEliteMemberPlan`, `GetCircleInbox` — §9). New mutation **`MarkEliteCircleActivityRead({ cheerIds? })`** (§9.4) marks received cheers read (whole inbox or a subset) and returns `{ marked, unreadEliteCircleActivityCount }` to refresh the badge; `RespondToCheer` already marks read. (2) **`GetWealthPlanDetails`** now also returns **`giftStats`** `{ giftsReceived, totalGifted, lastGiftDate }` (same shape as the gift preview, §6.8a). Responses are `data: JSON`; the only GraphQL schema additions are the `MarkEliteCircleActivityReadInput` input + mutation. 56 Build Wealth tests pass; typecheck clean. |
 | 2026-06-24 | **`futureCompoundingLost` on `PreviewWealthPlanWithdrawal`.** The withdrawal preview (§6.7b) now returns `futureCompoundingLost` — the future growth the withdrawn `grossAmount` would have earned had it stayed in the plan and compounded at the current APY until the plan's term end (`gross × ((1+r)^monthsRemaining − 1)`). Informational only (not deducted from `netToWallet`); surfaces the opportunity cost of withdrawing. Added the pure `futureCompoundingLost` calculator helper (+3 unit tests). Response is `data: JSON`, so no GraphQL schema change. |
 | 2026-06-24 | **Live value (`currentValue`) shown across wealth responses.** With interest now accruing daily but compounding monthly, the user-facing value would otherwise only step up at month-end. Added **`currentValue` = `balance + pendingInterest`** (= `totalContributed + totalInterestEarned`) — the headline "what my plan is worth", growing daily — to `GetWealthPlanDetails`, `GetAllWealthPlans` (per-plan + `summary.totalBalance` now sums it), the gift preview, and the Elite Circle list/member views; `GetSavingsPortfolioAllocation` counts Build Wealth at its live value too. Displayed **`progress`/`onTrackBalance`/`monthsToGoal`** are now computed from `currentValue`. **`currentBalance`** stays the compounding / withdrawable base (`balance`) that the **exit math** runs on — unchanged. No money-movement logic touched; 53 Build Wealth tests pass. |
 | 2026-06-24 | **Interest now accrues daily (monthly compounding).** Build Wealth previously only credited interest **once a month** (`wealth-plan-monthly-interest.ts` → `applyMonthlyInterest`), so `GetWealthPlanInterestEarned` showed `0`/empty for any plan under a month old and the chart only ever had monthly points. Reworked to the **daily-accrual / monthly-compounding** model (like Burse Vault's prorate-then-mature, but capitalizing instead of paying out): new daily job [`wealth-plan-daily-interest.ts`](src/jobs/wealth-plan-daily-interest.ts) (`EVERY_DAY_AT_MIDNIGHT_CRON`) **capitalizes** any due cycle (`capitalizeMonthlyInterest`, atomic `pendingInterest`→`balance`) then **accrues today's slice** (`accrueDailyInterest`: `balance × r ÷ daysInCycle` → `pendingInterest` + `totalInterestEarned` + a daily `INTEREST` ledger entry, idempotent per day `BW-INT-<plan>-<YYYY-MM-DD>`). Added a `pendingInterest` plan field (§5.1) surfaced on `GetWealthPlanDetails`, and the pure `dailyInterestAmount` calculator helper (a full cycle of slices sums to the monthly figure, so projections are unchanged; +3 unit tests, 53 Build Wealth tests pass). Rewrote §5.3/§7.3b; deleted the monthly job. **Diagnosis for BW140565:** not the endpoint and not a broken cron — the plan simply hadn't reached its first monthly maturity; it will now show interest from the first nightly run. |
