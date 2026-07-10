@@ -71,11 +71,11 @@ mutation {
   "maturityDate": "2027-07-08T23:59:59.999Z",
   "interestPayoutType": "MATURITY",
   "totalDays": 365,
-  "monthlyBreakdown": [ { "monthIndex": 0, "interestProrated": 1234.5, "days": 31, ... } ],
+  "monthlyBreakdown": [ { "monthIndex": 1, "interestProrated": 1234.5, "days": 31, ... } ],
   "simulation": {
     "eazilock": { "amountLocked": 1150000, "maturityAmount": 1200000, "interestAmount": 50000, ... },
     "events": [
-      { "type": "MONTHLY_CONTRIBUTION", "monthIndex": 0, "contribution": 95833.33, "interestProrated": 1234.5, ... },
+      { "type": "MONTHLY_CONTRIBUTION", "monthIndex": 1, "contribution": 95833.33, "interestProrated": 1234.5, ... },
       { "type": "END_OF_TERM_MATURITY", "amount": 1200000, "principal": 1150000, "totalInterest": 50000 }
     ],
     "totalDays": 365
