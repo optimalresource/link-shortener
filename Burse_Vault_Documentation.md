@@ -282,6 +282,7 @@ mutation {
 | `GetBurseVaultTransactionHistory(input)` | query | `{ vaultPlanId, transactionType?, startDate?, endDate?, search?, page?, limit? }` | Installmental contributions appear as `TOP_UP`; the first as `PLAN_PLEDGED`; maturity as `PLAN_MATURED`; monthly interest (MONTHLY payout) as `INTEREST_PAID`. |
 | `GenerateEazilockGrowthChart(...)` | query | `initialAmount, duration, period, periodCount` | Chart.js projection (ONE_TIME oriented). |
 | `GetBurseSavedCards` | query | – | Saved cards for funding selection. |
+| `GetSavingsDetails(input)` | query | `{ savingsType, savingsId, breakdownPeriod?, startDate?, endDate?, trendPeriod? }` | Single plan detail. For `EAZILOCK` the response now also includes the installmental/auto-save fields — `vaultType`, `monthlyContribution`, `totalContributed`, `targetAmount`, `fundingSources`, `nextChargeDate`, `missedContributions` — matching `GetEazilockSavings` exactly. |
 
 ---
 
